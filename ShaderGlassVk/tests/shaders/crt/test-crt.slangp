@@ -1,0 +1,16 @@
+shaders = 2
+
+shader0 = scanlines.slang
+filter_linear0 = false
+scale_type0 = source
+scale0 = 1.0
+srgb_framebuffer0 = false
+
+shader1 = blur.slang
+filter_linear1 = true
+scale_type1 = viewport
+scale1 = 1.0
+alias1 = blur_pass
+
+SCANLINE_WEIGHT = 0.45
+BRIGHTNESS = 1.1

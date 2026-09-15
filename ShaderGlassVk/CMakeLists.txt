@@ -1,0 +1,115 @@
+# ShaderGlassVk -- ShaderGlass on a Vulkan layer.
+#
+# Meson is the working build (see meson.build and tools/build.sh); this exists so the tree can be
+# configured and reviewed with the tool most C++ contributors expect. The two produce the same
+# binaries and must be kept in step.
+#
+# 32-bit builds come from a 32-bit toolchain, not a flag here:
+#   cmake -B build/linux32 -DCMAKE_CXX_FLAGS=-m32 -DCMAKE_EXE_LINKER_FLAGS=-m32 \
+#         -DCMAKE_SHARED_LINKER_FLAGS=-m32
+
+cmake_minimum_required(VERSION 3.16)
+project(shaderglassvk VERSION 0.1.0 LANGUAGES CXX)
+
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  message(FATAL_ERROR "ShaderGlassVk targets Linux; the Windows app is the tree beside this one")
+endif()
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
+endif()
+
+add_compile_options(-Wall -Wextra -Wno-unused-parameter)
+
+find_package(Threads REQUIRED)
+
+# Vulkan headers only -- the layer resolves every entry point through the loader's next-chain
+# GetProcAddr and must never link the loader itself.
+find_package(Vulkan QUIET)
+if(Vulkan_FOUND)
+  set(SG_VULKAN_INCLUDE ${Vulkan_INCLUDE_DIRS})
+else()
+  set(SG_VULKAN_INCLUDE "")
+endif()
+
+# --- the layer ---------------------------------------------------------------
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+  set(SG_LAYER_NAME VkLayer_ShaderGlass_32)
+  set(SG_LAYER_DEFINE SHADERGLASS_LAYER_32)
+else()
+  set(SG_LAYER_NAME VkLayer_ShaderGlass)
+  set(SG_LAYER_DEFINE)
+endif()
+
+add_library(${SG_LAYER_NAME} SHARED layer/src/layer.cpp layer/src/chain.cpp)
+
+target_include_directories(${SG_LAYER_NAME} PRIVATE layer/src common ${SG_VULKAN_INCLUDE})
+target_link_libraries(${SG_LAYER_NAME} PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+
+if(SG_LAYER_DEFINE)
+  target_compile_definitions(${SG_LAYER_NAME} PRIVATE ${SG_LAYER_DEFINE})
+endif()
+
+# Only the loader's entry points leave this object; see layer/shaderglass.map for why that matters.
+target_link_options(${SG_LAYER_NAME} PRIVATE
+  "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/layer/shaderglass.map"
+  "-Wl,-Bsymbolic"
+  "-static-libstdc++"
+  "-static-libgcc")
+
+set_target_properties(${SG_LAYER_NAME} PROPERTIES PREFIX "lib")
+
+# --- the generator -----------------------------------------------------------
+# glslang is required; SPIRV-Cross is optional and only changes which reflection backend is used.
+if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
+  find_library(SG_GLSLANG glslang)
+  find_library(SG_GLSLANG_RES glslang-default-resource-limits)
+
+  if(SG_GLSLANG AND SG_GLSLANG_RES)
+    set(SG_GEN_SOURCES
+      gen/main.cpp
+      gen/shadergc.cpp
+      gen/glsl.cpp
+      gen/reflect_builtin.cpp)
+
+    find_library(SG_SPIRV_CROSS_CORE spirv-cross-core)
+    find_path(SG_SPIRV_CROSS_INC spirv_cross/spirv_cross.hpp)
+
+    if(SG_SPIRV_CROSS_CORE AND SG_SPIRV_CROSS_INC)
+      message(STATUS "SPIRV-Cross found: reflection cross-check available")
+      list(APPEND SG_GEN_SOURCES gen/reflect_cross.cpp)
+    else()
+      message(STATUS "SPIRV-Cross not found: using the built-in SPIR-V reflection")
+    endif()
+
+    add_executable(shaderglass-gen ${SG_GEN_SOURCES})
+    target_include_directories(shaderglass-gen PRIVATE gen presets)
+    target_compile_definitions(shaderglass-gen PRIVATE
+      "SG_PRESET_API_H_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/presets/preset_api.h\"")
+    target_link_libraries(shaderglass-gen PRIVATE ${SG_GLSLANG} ${SG_GLSLANG_RES})
+
+    if(SG_SPIRV_CROSS_CORE AND SG_SPIRV_CROSS_INC)
+      target_compile_definitions(shaderglass-gen PRIVATE SG_HAVE_SPIRV_CROSS)
+      target_include_directories(shaderglass-gen PRIVATE ${SG_SPIRV_CROSS_INC})
+      target_link_libraries(shaderglass-gen PRIVATE ${SG_SPIRV_CROSS_CORE})
+    endif()
+  else()
+    message(STATUS "glslang not found: skipping shaderglass-gen")
+  endif()
+
+  # Reads a generated catalogue the way the layer will, through dlopen.
+  add_executable(catalog_test tests/catalog_test.cpp)
+  target_link_libraries(catalog_test PRIVATE ${CMAKE_DL_LIBS})
+endif()
+
+# --- the control tool --------------------------------------------------------
+# 64-bit only: a 32-bit game needs a 32-bit layer loaded into it, but nothing else here is per-arch.
+if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
+  add_executable(shaderglass-ctl tools/shmctl.cpp)
+  target_include_directories(shaderglass-ctl PRIVATE common)
+  target_link_options(shaderglass-ctl PRIVATE "-static-libstdc++" "-static-libgcc")
+endif()

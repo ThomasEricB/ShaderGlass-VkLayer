@@ -1,0 +1,13 @@
+{
+  "file_format_version": "1.2.0",
+  "layer": {
+    "name": "VK_LAYER_SHADERGLASS_32",
+    "type": "GLOBAL",
+    "library_path": "./libVkLayer_ShaderGlass_32.so",
+    "api_version": "1.3.277",
+    "implementation_version": "1",
+    "description": "ShaderGlass shader effect layer",
+    "enable_environment": { "SHADERGLASS": "1" },
+    "disable_environment": { "SHADERGLASS_DISABLE": "1" }
+  }
+}
