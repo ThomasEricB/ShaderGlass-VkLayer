@@ -337,6 +337,26 @@ int Usage() {
 
 }  // namespace
 
+// Every uniform member that is neither a semantic the runtime fills in nor a parameter the shader
+// declared. Each reads zero. Most are shaders that simply forgot a #pragma parameter, but a
+// semantic this layer has not implemented looks exactly the same from here -- and that is how
+// OriginalFPS stayed missing long enough to turn a whole preset family black. Worth a glance
+// whenever a preset misbehaves for no visible reason.
+void ReportUndeclaredUniforms(const Registry& registry) {
+    if (registry.undeclaredUniforms.empty()) return;
+
+    std::cout << "\n" << registry.undeclaredUniforms.size()
+              << " uniform members are neither a semantic nor a declared parameter"
+                 " (each reads zero):\n ";
+    size_t on = 0;
+    for (const auto& name : registry.undeclaredUniforms) {
+        if (on && on % 6 == 0) std::cout << "\n ";
+        std::cout << " " << name;
+        ++on;
+    }
+    std::cout << "\n";
+}
+
 int main(int argc, char** argv) {
     fs::path out;
     fs::path tree;
@@ -480,6 +500,7 @@ int main(int argc, char** argv) {
                                                  presetBytes) /
                                       double(inlineBytes))
                       << " %\n";
+        ReportUndeclaredUniforms(registry);
         return failed ? 1 : 0;
     }
 
@@ -532,6 +553,8 @@ int main(int argc, char** argv) {
     std::cout << "\n" << compiled << " compiled, " << failed << " failed";
     if (reflectCheck) std::cout << ", " << mismatched << " reflection mismatches";
     std::cout << " (reflection backend: " << ReflectBackendName() << ")\n";
+
+    ReportUndeclaredUniforms(registry);
 
     return failed || mismatched ? 1 : 0;
 }

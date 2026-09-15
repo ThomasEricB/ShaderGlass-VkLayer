@@ -99,6 +99,7 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
       gen/main.cpp
       gen/shadergc.cpp
     gen/spirv_edit.cpp
+    layer/src/semantics.cpp
       gen/glsl.cpp
       gen/reflect_builtin.cpp)
 

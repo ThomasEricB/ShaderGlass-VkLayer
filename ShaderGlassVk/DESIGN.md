@@ -83,6 +83,7 @@ so recording a frame never compares a string.
 | **A declared pass format that the device cannot render to falls back to the chain's format — unless it is an integer format**, which fails the chain instead | Found by `test/format`: `#pragma format R32_UINT` is read back through a `usampler2D`, so substituting a UNORM image is a type error the shader cannot survive, not a loss of precision |
 | **A sampler that resolves to nothing binds the frame** | An unwritten descriptor is undefined behaviour; a wrong-looking pass is better than a crash inside someone's game |
 | **`<Alias>Feedback` resolves to that pass's previous frame**, and `OriginalFeedback` to `OriginalHistory1` | Sixty-odd libretro shaders spell feedback by alias rather than by index — `AfterglowPassFeedback`, `AvgLumPassFeedback`. Reading them as ordinary texture names is not an error anyone sees: the pass silently samples the current frame, which is a feedback loop with no delay. Finding this took counting feedback passes in the build log — a Mega Bezel preset reported 0 and should have reported 6 |
+| **Indexed texture sizes are spelled `OriginalHistorySize1`, `PassOutputSize0`, `PassFeedbackSize0`** — the index after "Size", not before | This is the only spelling the libretro tree uses: 43 occurrences, against none of the `<name><index>Size` form. The first implementation here had it backwards and the unit test asserted the wrong way round with it, so the test agreed with the assumption instead of catching it |
 | **`OriginalFPS` reports the game's presentation rate, smoothed, and never zero** | It is the rate a libretro core runs its content at, and shaders derive line counts and colour-carrier timing by dividing by it. Left unimplemented it is a silent zero, and the whole `bezel/scanline-classic` family — every composite preset in it — turns to NaN at the demodulator and renders black. Smoothed because a rate that jitters frame to frame makes the picture jitter with it |
 | **`FrameTimeDelta`, `OriginalAspect`, `OriginalAspectRotated`, `TotalSubFrames`, `CurrentSubFrame` and `Rotation` are filled in** | They are uniform-block members like any other, so an unhandled one is not a failure — it is a silent zero. Zero freezes anything integrating over frame time, and `TotalSubFrames` of zero is a divide waiting to happen. This layer composes once per present, so subframes are always 1 of 1 |
 | **A `<Something>Size` that names nothing the preset declared keeps its parameter value** instead of reporting the frame's size | A shader parameter may end in "Size" too (`FrameHSize`), and there is no way to tell from the name. A sampler must be bound to something valid, so that path still substitutes the frame; a size can honestly stay what it was |
@@ -117,6 +118,28 @@ every pixel whose luma falls below the shader's threshold.
 `bezel/scanline-classic`'s `limiter.slang` does the same to a composite signal's sub-black
 excursions: its gamma guard is `color.r < 1.0`, meant to leave extended values above 1.0 alone,
 which also admits the values below zero the same signal carries deliberately.
+
+### Auditing the semantics, rather than remembering them
+
+An unimplemented semantic does not fail. It reads zero, and the shader carries on into a divide or a
+black frame — which is how `OriginalFPS` stayed missing. Eyeballing a frequency-sorted list is what
+let it hide the first time, so the check is now mechanical and repeatable:
+
+- every uniform block member in the catalogue with no `#pragma parameter` declaration is classified
+  through the layer's own `ClassifyUniform`, and anything still landing on "parameter" is reviewed;
+- every sampler name is classified through `ClassifyTexture`, and any structural-looking name that
+  lands on "LUT or alias" is checked against what the presets actually declare.
+
+`shaderglass-gen` now prints the first of those as a summary at the end of a tree run — *N uniform
+members are neither a semantic nor a declared parameter (each reads zero)* — and links the layer's
+`semantics.cpp` to do it, so the generator's idea of a semantic cannot drift from the runtime's.
+
+The audit as it stands: 664 distinct undeclared uniform names, of which 55 are texture sizes and 12
+are named semantics; the remaining 597 are shader parameters, and the only ones spelled like a
+semantic (`MaxNits`, `PaperWhiteNits`, `InputGamma` and seven more) are declared with
+`#pragma parameter` in most shaders and merely omitted in a few, so they read zero in RetroArch too.
+Of 317 sampler names, every structural-looking one (`Pass1`, `PassPrev2`, `SourceHDR`) is a preset
+alias — `Pass1` in 891 presets — and resolves through the alias mechanism.
 
 ### Decisions taken without asking, and why
 

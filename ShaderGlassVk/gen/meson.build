@@ -11,6 +11,7 @@ gen_sources = files(
   'main.cpp',
   'shadergc.cpp',
   'spirv_edit.cpp',
+  '../layer/src/semantics.cpp',
   'glsl.cpp',
   'reflect_builtin.cpp',
 )

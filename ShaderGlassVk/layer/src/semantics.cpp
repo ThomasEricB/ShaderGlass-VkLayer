@@ -160,6 +160,20 @@ UniformRef ClassifyUniform(const std::string& name) {
         return ref;
     }
 
+    // The indexed texture semantics put the index *after* "Size": OriginalHistorySize1,
+    // PassOutputSize0, PassFeedbackSize0. That is the only spelling the libretro tree uses -- 43
+    // occurrences, against none of the "<name><index>Size" form -- so the index is moved back
+    // before classifying the stem.
+    {
+        size_t digits = name.size();
+        while (digits > 0 && name[digits - 1] >= '0' && name[digits - 1] <= '9') --digits;
+        if (digits < name.size() && digits >= 4 && name.compare(digits - 4, 4, "Size") == 0) {
+            ref.texture = ClassifyTexture(name.substr(0, digits - 4) + name.substr(digits));
+            ref.semantic = UniformSemantic::kTextureSize;
+            return ref;
+        }
+    }
+
     // "<Something>Size" sizes a texture. The catch is that a shader parameter is free to end in
     // Size too, so this only claims the name when the stem resolves to a texture semantic the
     // preset can actually satisfy -- a structural one here, and a declared LUT or alias at the

@@ -21,6 +21,7 @@ feed a D3D11 renderer; the Vulkan layer wants the SPIR-V glslang already produce
 #include "common.h"
 
 #include <memory>
+#include <set>
 
 namespace shaderglass {
 
@@ -114,6 +115,13 @@ struct Registry {
     // How much work the sharing saved, for the generator's summary.
     size_t shaderRequests = 0;
     size_t textureRequests = 0;
+
+    // Uniform block members that are neither a semantic the runtime fills in nor a parameter the
+    // shader declared. Each one silently reads zero. Collected rather than warned about line by
+    // line -- there are tens of thousands of occurrences over the libretro tree and only a few
+    // hundred distinct names -- and reported once at the end, because this is the list to read
+    // when a preset misbehaves for no visible reason. OriginalFPS sat in it unnoticed.
+    std::set<std::string> undeclaredUniforms;
 };
 
 // Compile a .slangp preset, or a bare .slang treated as a one-pass preset.

@@ -107,7 +107,32 @@ int main() {
     CheckUniform("CurrentSubFrame", UniformSemantic::kCurrentSubFrame);
     CheckUniform("SourceSize", UniformSemantic::kTextureSize);
     CheckUniform("OriginalSize", UniformSemantic::kTextureSize);
-    CheckUniform("PassOutput2Size", UniformSemantic::kTextureSize);
+
+    // The indexed forms put the index after "Size" -- this is the spelling the libretro tree
+    // actually uses, and the only one it uses. An earlier version of this test asserted
+    // "PassOutput2Size", which appears nowhere in 1463 shaders; the assumption was wrong and the
+    // test encoded it rather than catching it.
+    {
+        const UniformRef ref = ClassifyUniform("OriginalHistorySize1");
+        Check(ref.semantic == UniformSemantic::kTextureSize, "OriginalHistorySize1 is a texture size");
+        Check(ref.texture.semantic == TextureSemantic::kHistory, "...of a history texture");
+        Check(ref.texture.index == 1, "...at index 1");
+    }
+    {
+        const UniformRef ref = ClassifyUniform("PassOutputSize0");
+        Check(ref.semantic == UniformSemantic::kTextureSize, "PassOutputSize0 is a texture size");
+        Check(ref.texture.semantic == TextureSemantic::kPassOutput, "...of a pass output");
+        Check(ref.texture.index == 0, "...at index 0");
+    }
+    {
+        const UniformRef ref = ClassifyUniform("PassFeedbackSize0");
+        Check(ref.semantic == UniformSemantic::kTextureSize, "PassFeedbackSize0 is a texture size");
+        Check(ref.texture.semantic == TextureSemantic::kPassFeedback, "...of a pass feedback");
+        Check(ref.texture.index == 0, "...at index 0");
+    }
+
+    // A pass alias keeps the plain "<Alias>Size" spelling, which must still work.
+    CheckUniform("CRTPassSize", UniformSemantic::kTextureSize);
 
     // Shader parameters, which is what most members are.
     CheckUniform("CRTgamma", UniformSemantic::kParameter);
@@ -122,11 +147,11 @@ int main() {
     }
 
     // "<X>Size" names a texture, and the stem is classified in its own right.
+    // A parameter that merely ends in digits must not be mistaken for an indexed size.
+    CheckUniform("Downsample1Size", UniformSemantic::kTextureSize);  // an alias, via <Alias>Size
     {
-        const UniformRef ref = ClassifyUniform("OriginalHistory2Size");
-        Check(ref.semantic == UniformSemantic::kTextureSize, "OriginalHistory2Size is a texture size");
-        Check(ref.texture.semantic == TextureSemantic::kHistory, "...of a history texture");
-        Check(ref.texture.index == 2, "...at index 2");
+        const UniformRef ref = ClassifyUniform("MASK_SIZE2");
+        Check(ref.semantic == UniformSemantic::kParameter, "MASK_SIZE2 stays a parameter");
     }
 
     // --- preset values ---

@@ -14,6 +14,8 @@ Ported from ShaderGC (mausimus). See shadergc.h for what was kept and what was d
 #include "reflect.h"
 #include "spirv_edit.h"
 
+#include "../layer/src/semantics.h"
+
 #include <algorithm>
 #include <cctype>
 #include <cstring>
@@ -298,6 +300,18 @@ std::shared_ptr<GenShaderData> CompileShaderCached(const std::filesystem::path& 
 
     std::vector<GenSampler> textures;
     shader->params = LookupParams(split.params, textures, r);
+
+    // A uniform block member is one of three things: a semantic the runtime fills in, a parameter
+    // the shader declared with #pragma parameter, or a mistake. The third kind silently reads
+    // zero, which is how OriginalFPS went unimplemented here long enough to turn an entire preset
+    // family black -- nothing said the shader had asked for something nobody was providing. Now
+    // something does. The classifier is the layer's own (layer/src/semantics.cpp), so the two
+    // cannot drift apart.
+    for (const auto& param : shader->params) {
+        if (!param.desc.empty()) continue;  // declared with #pragma parameter
+        if (ClassifyUniform(param.name).semantic != UniformSemantic::kParameter) continue;
+        registry.undeclaredUniforms.insert(param.name);
+    }
     shader->samplers = textures;
 
     registry.shaders.emplace(key, shader);
