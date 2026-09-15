@@ -27,8 +27,24 @@ struct Image {
     VkImageView view = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t width = 0, height = 0;
+
+    // More than one when a pass declares mipmap_input over what it reads, or a preset declares
+    // <texture>_mipmap. The tracked layout covers every level: the one place levels are moved
+    // independently is GenerateMipmaps, which puts them all back the same way before it returns.
+    uint32_t levels = 1;
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
 };
+
+// How many mip levels an image of this size can have, down to 1x1.
+inline uint32_t MipLevelsFor(uint32_t w, uint32_t h) {
+    uint32_t levels = 1;
+    while (w > 1 || h > 1) {
+        w = w > 1 ? w / 2 : 1;
+        h = h > 1 ? h / 2 : 1;
+        ++levels;
+    }
+    return levels;
+}
 
 // A host-visible buffer, mapped for the life of the chain.
 struct HostBuffer {
@@ -64,15 +80,20 @@ inline void DropImage(const DeviceTable* vk, VkDevice device, Image& img) {
 
 inline bool MakeImage(const DeviceTable* vk, const InstanceTable* instance, VkDevice device,
                       VkPhysicalDevice phys, Image& img, uint32_t w, uint32_t h, VkFormat format,
-                      VkImageUsageFlags usage) {
+                      VkImageUsageFlags usage, uint32_t levels = 1) {
     DropImage(vk, device, img);
+    if (levels < 1) levels = 1;
+
+    // Every level is filled by blitting from the one above, so a mipmapped image is both a transfer
+    // source and a transfer destination whatever else it is for.
+    if (levels > 1) usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 
     VkImageCreateInfo ci {};
     ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     ci.imageType = VK_IMAGE_TYPE_2D;
     ci.format = format;
     ci.extent = {w, h, 1};
-    ci.mipLevels = 1;
+    ci.mipLevels = levels;
     ci.arrayLayers = 1;
     ci.samples = VK_SAMPLE_COUNT_1_BIT;
     ci.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -111,7 +132,7 @@ inline bool MakeImage(const DeviceTable* vk, const InstanceTable* instance, VkDe
     vi.image = img.image;
     vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
     vi.format = format;
-    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, 1};
     if (vk->vkCreateImageView(device, &vi, nullptr, &img.view) != VK_SUCCESS) {
         DropImage(vk, device, img);
         return false;
@@ -120,6 +141,7 @@ inline bool MakeImage(const DeviceTable* vk, const InstanceTable* instance, VkDe
     img.format = format;
     img.width = w;
     img.height = h;
+    img.levels = levels;
     img.layout = VK_IMAGE_LAYOUT_UNDEFINED;
     return true;
 }
@@ -221,7 +243,7 @@ inline void Transition(const DeviceTable* vk, VkCommandBuffer cb, Image& img, Vk
     b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = img.image;
-    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, img.levels, 0, 1};
     b.srcAccessMask = srcAccess;
     b.dstAccessMask = dstAccess;
 
@@ -250,6 +272,102 @@ inline void TransitionForeign(const DeviceTable* vk, VkCommandBuffer cb, VkImage
     b.dstAccessMask = dstAccess;
 
     vk->vkCmdPipelineBarrier(cb, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &b);
+}
+
+// Fill an image's mip chain from level 0 by successive halving blits, leaving every level in
+// SHADER_READ_ONLY_OPTIMAL. The caller supplies level 0's contents and its current layout; nothing
+// else about the image is assumed.
+//
+// This is what makes mipmap_input work, and roughly half the libretro presets ask for it: a glow or
+// bloom pass that samples a mip chain reads level 0 everywhere without it, which does not fail --
+// it just quietly looks wrong.
+inline void GenerateMipmaps(const DeviceTable* vk, VkCommandBuffer cb, Image& img) {
+    if (img.levels <= 1) {
+        Transition(vk, cb, img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        return;
+    }
+
+    VkImageMemoryBarrier b {};
+    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = img.image;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+    // Level 0 holds what the caller produced, in whatever layout that left it; it becomes the
+    // source of the first blit.
+    VkAccessFlags srcAccess;
+    VkPipelineStageFlags srcStage;
+    AccessForLayout(img.layout, &srcAccess, &srcStage);
+
+    b.subresourceRange.baseMipLevel = 0;
+    b.oldLayout = img.layout;
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    b.srcAccessMask = srcAccess;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vk->vkCmdPipelineBarrier(cb, srcStage, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                             1, &b);
+
+    // Every other level is about to be written and has never held anything, so it comes from
+    // UNDEFINED. Saying otherwise -- claiming they share level 0's layout -- is the mistake that
+    // leaves them undefined at draw time.
+    b.subresourceRange.baseMipLevel = 1;
+    b.subresourceRange.levelCount = img.levels - 1;
+    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.srcAccessMask = 0;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vk->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                             0, nullptr, 0, nullptr, 1, &b);
+    b.subresourceRange.levelCount = 1;
+
+    int32_t w = int32_t(img.width), h = int32_t(img.height);
+    for (uint32_t level = 1; level < img.levels; ++level) {
+        const int32_t nw = w > 1 ? w / 2 : 1;
+        const int32_t nh = h > 1 ? h / 2 : 1;
+
+        VkImageBlit blit {};
+        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level - 1, 0, 1};
+        blit.srcOffsets[1] = {w, h, 1};
+        blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
+        blit.dstOffsets[1] = {nw, nh, 1};
+        vk->vkCmdBlitImage(cb, img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, img.image,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+
+        // Written; now it is the next blit's source, unless it is the last level.
+        if (level + 1 < img.levels) {
+            b.subresourceRange.baseMipLevel = level;
+            b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            vk->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                                     &b);
+        }
+
+        w = nw;
+        h = nh;
+    }
+
+    // Levels 0..n-2 ended as blit sources, the last as a blit destination.
+    b.subresourceRange.baseMipLevel = 0;
+    b.subresourceRange.levelCount = img.levels - 1;
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vk->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+
+    b.subresourceRange.baseMipLevel = img.levels - 1;
+    b.subresourceRange.levelCount = 1;
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vk->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+
+    img.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 }
 
 }  // namespace shaderglass

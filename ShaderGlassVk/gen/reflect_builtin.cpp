@@ -57,8 +57,13 @@ constexpr uint32_t DecorationBinding = 33;
 constexpr uint32_t DecorationDescriptorSet = 34;
 constexpr uint32_t DecorationOffset = 35;
 
+constexpr uint32_t DecorationLocation = 30;
+constexpr uint32_t DecorationComponent = 31;
+
 constexpr uint32_t StorageClassUniformConstant = 0;
+constexpr uint32_t StorageClassInput = 1;
 constexpr uint32_t StorageClassUniform = 2;
+constexpr uint32_t StorageClassOutput = 3;
 constexpr uint32_t StorageClassPushConstant = 9;
 
 struct TypeInfo {
@@ -411,6 +416,83 @@ const char* ReflectBackendName() {
 #else
     return "built-in";
 #endif
+}
+
+
+namespace {
+
+// The user-defined interface of one stage: every variable in `storage` that carries a Location.
+// Built-ins (gl_Position, gl_FragCoord) carry BuiltIn instead of Location, so they fall out on
+// their own without needing to be named.
+std::vector<InterfaceSlot> StageInterface(const std::vector<uint32_t>& spirv, uint32_t storage) {
+    if (spirv.size() < 5 || spirv[0] != kMagic) throw std::runtime_error("not a SPIR-V module");
+
+    std::map<uint32_t, uint32_t> locations, components;
+    std::map<uint32_t, std::string> names;
+    std::map<uint32_t, uint32_t> storageOf;
+
+    size_t at = 5;
+    while (at < spirv.size()) {
+        const uint32_t word = spirv[at];
+        const uint16_t op = uint16_t(word & 0xFFFF);
+        const uint16_t count = uint16_t(word >> 16);
+        if (count == 0 || at + count > spirv.size()) break;
+
+        if (op == OpDecorate && count >= 4) {
+            if (spirv[at + 2] == DecorationLocation) locations[spirv[at + 1]] = spirv[at + 3];
+            else if (spirv[at + 2] == DecorationComponent) components[spirv[at + 1]] = spirv[at + 3];
+        } else if (op == OpVariable && count >= 4) {
+            storageOf[spirv[at + 2]] = spirv[at + 3];
+        } else if (op == OpName && count >= 3) {
+            size_t consumed = 0;
+            names[spirv[at + 1]] = ReadString(spirv, at + 2, at + count, &consumed);
+        }
+        at += count;
+    }
+
+    std::vector<InterfaceSlot> slots;
+    for (const auto& kv : storageOf) {
+        if (kv.second != storage) continue;
+        auto loc = locations.find(kv.first);
+        if (loc == locations.end()) continue;
+
+        InterfaceSlot slot;
+        slot.location = loc->second;
+        auto comp = components.find(kv.first);
+        slot.component = comp == components.end() ? 0u : comp->second;
+        auto name = names.find(kv.first);
+        slot.name = name == names.end() ? std::string() : name->second;
+        slots.push_back(std::move(slot));
+    }
+    return slots;
+}
+
+}  // namespace
+
+std::vector<InterfaceSlot> StageInputs(const std::vector<uint32_t>& spirv) {
+    return StageInterface(spirv, StorageClassInput);
+}
+
+std::vector<InterfaceSlot> StageOutputs(const std::vector<uint32_t>& spirv) {
+    return StageInterface(spirv, StorageClassOutput);
+}
+
+std::vector<InterfaceSlot> UnmatchedInputs(const std::vector<uint32_t>& vertex,
+                                           const std::vector<uint32_t>& fragment) {
+    const auto outputs = StageOutputs(vertex);
+    std::vector<InterfaceSlot> missing;
+
+    for (const auto& in : StageInputs(fragment)) {
+        bool found = false;
+        for (const auto& out : outputs) {
+            if (out.location == in.location && out.component == in.component) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) missing.push_back(in);
+    }
+    return missing;
 }
 
 }  // namespace shaderglass

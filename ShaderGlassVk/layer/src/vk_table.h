@@ -113,7 +113,8 @@ namespace shaderglass {
     X(vkCmdSetScissor)                                                                             \
     X(vkCmdDraw)                                                                                   \
     X(vkCmdDispatch)                                                                               \
-    X(vkCmdPushConstants)
+    X(vkCmdPushConstants)                                                                          \
+    X(vkCmdClearColorImage)
 
 struct InstanceTable {
     PFN_vkGetInstanceProcAddr next_gipa = nullptr;

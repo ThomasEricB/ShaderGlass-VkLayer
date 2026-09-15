@@ -12,6 +12,7 @@ Ported from ShaderGC (mausimus). See shadergc.h for what was kept and what was d
 
 #include "glsl.h"
 #include "reflect.h"
+#include "spirv_edit.h"
 
 #include <algorithm>
 #include <cctype>
@@ -167,7 +168,9 @@ void SetPassParam(const std::string& name, GenPass& pass, int i,
                   const std::map<std::string, std::string>& keyValues,
                   std::unordered_set<std::string>& seen) {
     const auto value = GetValue(name, i, keyValues, seen);
-    if (!value.empty()) pass.presetParams.emplace(name, value);
+    // Assignment, not emplace: MakePass has already seeded "alias" from the shader's own
+    // #pragma name, and a preset that says alias0 = "Foo" is meant to win over it.
+    if (!value.empty()) pass.presetParams[name] = value;
 }
 
 // Every per-pass key a preset may set. Consumed by the runtime in phase 4.
@@ -273,6 +276,21 @@ std::shared_ptr<GenShaderData> CompileShaderCached(const std::filesystem::path& 
 
     shader->vertex = GenerateSPIRV(split.vertex.c_str(), false, log, warn);
     shader->fragment = GenerateSPIRV(split.fragment.c_str(), true, log, warn);
+
+    // See spirv_edit.h: RelaxedPrecision in a vertex stage buys nothing over four vertices and
+    // segfaults at least one shipping driver's shader compiler.
+    StripRelaxedPrecision(shader->vertex);
+
+    // A fragment input the vertex stage never writes reads undefined values, and the Vulkan
+    // runtime reports it as VUID-RuntimeSpirv-OpEntryPoint-08743 when the pipeline is built --
+    // inside someone's game, by which point nobody can tell whose fault it is. Fifteen shaders in
+    // the libretro tree are written that way, so it is said here instead.
+    for (const auto& slot : UnmatchedInputs(shader->vertex, shader->fragment)) {
+        log << "warn  " << shader->name << ": the fragment stage reads '" << slot.name
+            << "' at location " << slot.location
+            << ", which the vertex stage never writes; its value is undefined\n";
+        warn = true;
+    }
 
     // The fragment stage carries the full uniform block and every texture, which is why ShaderGC
     // reflects that one and not the vertex stage.
@@ -450,7 +468,9 @@ GenPreset CompilePreset(const std::filesystem::path& input, Registry& registry, 
 
             // Shared by content: one set of bezel art is referenced by hundreds of Mega Bezel
             // presets, and emitting it per preset is what made the first attempt unbuildable.
-            char hash[32];
+            // 16 hex digits, a separator, and up to 20 decimal digits of length, so the key is
+            // never truncated -- two textures whose keys collided would be emitted as one.
+            char hash[40];
             snprintf(hash, sizeof(hash), "%016llx_%zu",
                      (unsigned long long) HashBytes(bytes), bytes.size());
 

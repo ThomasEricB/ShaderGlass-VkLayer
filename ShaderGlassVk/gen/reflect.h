@@ -73,4 +73,22 @@ bool ReflectionsAgree(const Reflection& a, const Reflection& b, std::string* dif
 
 const char* ReflectBackendName();
 
+// One stage's user-defined interface: the (location, component) slots it declares, and what each is
+// called. Fragment inputs must be covered by vertex outputs -- a pair that does not line up is what
+// the Vulkan runtime reports as VUID-RuntimeSpirv-OpEntryPoint-08743, and the fragment stage then
+// reads undefined values. Fifteen shaders in the libretro tree are written that way, so the
+// generator says which rather than leaving it to show up inside somebody's game.
+struct InterfaceSlot {
+    uint32_t location = 0;
+    uint32_t component = 0;
+    std::string name;
+};
+
+std::vector<InterfaceSlot> StageInputs(const std::vector<uint32_t>& spirv);
+std::vector<InterfaceSlot> StageOutputs(const std::vector<uint32_t>& spirv);
+
+// Fragment inputs with no matching vertex output. Empty when the pair lines up.
+std::vector<InterfaceSlot> UnmatchedInputs(const std::vector<uint32_t>& vertex,
+                                           const std::vector<uint32_t>& fragment);
+
 }  // namespace shaderglass

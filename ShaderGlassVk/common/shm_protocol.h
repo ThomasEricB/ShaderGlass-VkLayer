@@ -128,6 +128,29 @@ struct ShmParam {
     std::atomic<uint32_t> valueBits;
 };
 
+// A float is carried as its bits because std::atomic<float> has no lock-free guarantee across the
+// ABIs this mapping is shared over, while a 32-bit integer does. memcpy rather than a cast: type
+// punning through a pointer is undefined, and every compiler folds this away.
+inline uint32_t ShmFloatBits(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+inline float ShmBitsFloat(uint32_t bits) {
+    float value = 0.0f;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+inline void ShmStoreParam(ShmParam& param, float value) {
+    param.valueBits.store(ShmFloatBits(value), std::memory_order_relaxed);
+}
+
+inline float ShmLoadParam(const ShmParam& param) {
+    return ShmBitsFloat(param.valueBits.load(std::memory_order_relaxed));
+}
+
 struct ShmHeader {
     std::atomic<uint32_t> magic;
     std::atomic<uint32_t> version;

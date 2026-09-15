@@ -1,6 +1,6 @@
 # ShaderGlass on a Vulkan layer — design and port plan
 
-**Status:** phases 1-3 complete (tree, builds, protocol, layer, pass executor, and the .slangp -> SPIR-V compiler with a generated catalogue). The full libretro `slang-shaders` tree compiles: 3328 of 3330 presets, the other 2 being parameter fragments rather than presets, and 49 files failing only on dangling references that are broken in upstream itself. Phase 4 next.
+**Status:** phases 1-4 complete (tree, builds, protocol, layer, the full multi-pass executor, and the .slangp -> SPIR-V compiler with a generated catalogue). The full libretro `slang-shaders` tree compiles: 3328 of 3330 presets, the other 2 being parameter fragments rather than presets, and 49 files failing only on dangling references that are broken in upstream itself. Phase 5 next.
 **Scope:** everything below is additive under `ShaderGlassVk/`. No existing upstream file is modified,
 moved or deleted, so the Windows app builds exactly as it does today.
 
@@ -65,6 +65,49 @@ process, which is a strict simplification of DLSS5VKLayer's protocol.
 | 15 | **GUI**: DLSS5VKLayer's tabbed settings widget and binder, with tabs named Shader / Input / Output / Advanced |
 | 16 | **Pixel size stays its own control**, independent of source resolution: ×1…×10.8 as in the Windows app, deciding how many screen pixels one source pixel occupies. Defaults to **Auto** |
 | 17 | **Output policy** — what happens when source × pixel size ≠ swapchain: Auto (default), Stretch to fill, Fit, Fill, Integer + letterbox, Centre 1:1 |
+
+### The pass model (phase 4)
+
+A pass reads what the *names in its shader* ask for, not what the preset lists: a sampler called
+`PassFeedback2` wants pass 2's output from the previous frame, `OriginalHistory3` wants the frame
+from three frames ago, and a `vec4` called `SourceSize` wants `(w, h, 1/w, 1/h)` of whatever the
+pass is reading. `layer/src/semantics.h` is that vocabulary, resolved once when the chain is built
+so recording a frame never compares a string.
+
+| Decision | Why |
+|---|---|
+| **The last pass renders at the swapchain's raster, in the chain's format**, whatever its declared scale says | What RetroArch does with a final pass, and it makes the copy into the swapchain a plain `vkCmdCopyImage` |
+| **Feedback passes ping-pong between two images**, rather than copying output to a feedback image | A full-resolution copy per feedback pass per frame, avoided for the cost of one extra image on the few passes that need it |
+| **History is a ring written at the end of the frame**, after the passes have read it | At depth 1 the entry being written is the one `OriginalHistory1` just pointed at; writing first would feed a pass its own frame |
+| **Feedback and history images are cleared on the first frame after a build** | They are sampled before anything writes them, and undefined contents are undefined behaviour, not merely an ugly first frame |
+| **A declared pass format that the device cannot render to falls back to the chain's format — unless it is an integer format**, which fails the chain instead | Found by `test/format`: `#pragma format R32_UINT` is read back through a `usampler2D`, so substituting a UNORM image is a type error the shader cannot survive, not a loss of precision |
+| **A sampler that resolves to nothing binds the frame** | An unwritten descriptor is undefined behaviour; a wrong-looking pass is better than a crash inside someone's game |
+| **`<Alias>Feedback` resolves to that pass's previous frame**, and `OriginalFeedback` to `OriginalHistory1` | Sixty-odd libretro shaders spell feedback by alias rather than by index — `AfterglowPassFeedback`, `AvgLumPassFeedback`. Reading them as ordinary texture names is not an error anyone sees: the pass silently samples the current frame, which is a feedback loop with no delay. Finding this took counting feedback passes in the build log — a Mega Bezel preset reported 0 and should have reported 6 |
+| **`FrameTimeDelta`, `OriginalAspect`, `OriginalAspectRotated`, `TotalSubFrames`, `CurrentSubFrame` and `Rotation` are filled in** | They are uniform-block members like any other, so an unhandled one is not a failure — it is a silent zero. Zero freezes anything integrating over frame time, and `TotalSubFrames` of zero is a divide waiting to happen. This layer composes once per present, so subframes are always 1 of 1 |
+| **A `<Something>Size` that names nothing the preset declared keeps its parameter value** instead of reporting the frame's size | A shader parameter may end in "Size" too (`FrameHSize`), and there is no way to tell from the name. A sampler must be bound to something valid, so that path still substitutes the frame; a size can honestly stay what it was |
+| **`mipmap_input` builds a real mip chain**, on pass outputs, on Original and on preset textures | 1645 presets set it and 2568 pass declarations turn it on — roughly half the catalogue. Without it a glow or bloom pass samples level 0 everywhere, which does not fail, it just quietly looks wrong. A mipmapped pass needs a second image view over level 0 alone, because a framebuffer attachment may not span a chain |
+| **History frames are never mipmapped**, even when Original is | A history entry is a copy of Original, no preset asks for a chain on a past frame, and building one per entry per frame is not cheap |
+| **`PassOutput#` resolves only for a pass earlier than the one asking** | Its own index is the image it is drawing into — a read-write hazard — and a later index has not rendered yet. libretro ships `test/feedback-noncausal` for precisely this case, and the name is the verdict |
+| **Preset textures stay compressed in the catalogue and are decoded at load time** | Over the libretro tree they are 43 MiB as PNG and JPEG and 1.19 GiB as raw RGBA. Upstream decodes with WIC for the same reason; this uses stb_image, which is header-only and so adds nothing to what the layer links against — worth caring about for a library mapped into every game |
+| **Parameter precedence: shader default, then preset override, then the interface** | Resolved when a value changes rather than per frame, since a preset like crt-royale has dozens of parameters across dozens of passes |
+| **`Chain::FrameCompleted()` is the caller's one ordering obligation**: call it once the previous `Record`'s submit has retired | Texture staging buffers are tens of megabytes for a Mega Bezel preset and have to be released, but only the caller knows when the GPU is done with them. An earlier version inferred it inside `Record` and destroyed a buffer underneath a command buffer that still referenced it — `chain_test` caught it on the first 23-texture preset it ran |
+
+### Patching upstream shaders
+
+The catalogue is generated from libretro's `slang-shaders` unmodified wherever possible. `patches/`
+is the exception, for shaders that are broken as written rather than merely different: each patch
+carries its reasoning in its header and is reportable upstream as-is.
+
+The mechanism matters as much as the patches. `tools/build-catalogue.sh` is the single command that
+fetches, patches, generates and compiles, it **refuses to generate from a tree it could not patch**,
+and it is what packaging calls — so a catalogue that reaches a user cannot be missing them. A patch
+that no longer applies is a failure, not a skip, because the likeliest reason is that the shader was
+fixed upstream and the patch should go.
+
+So far there is one: `crt/simple-crt` raises a negative number to a power. `pow(x, y)` is undefined
+in GLSL for `x < 0`, the shader's `* float(diff > 0.0)` guard cannot discard the result because
+NaN × 0 is still NaN, and on NVIDIA's Vulkan compiler about 88 % of every frame comes out black —
+every pixel whose luma falls below the shader's threshold.
 
 ### Decisions taken without asking, and why
 
@@ -240,10 +283,10 @@ lost; what goes is capture and window management, which is exactly what the laye
 | 1 | Tree, Meson + CMake, manifest, protocol header, layer that loads and passes frames through untouched; `shaderglass-ctl` |
 | 2 | **Done.** Pass executor with a built-in passthrough: swapchain → source raster → one pass → swapchain, verified bit-exact and validation-clean |
 | 3 | **Done.** ShaderGC ported to Linux emitting SPIR-V; `shaderglass-gen` producing the catalogue; the preset library builds and loads through `dlopen` |
-| 4 | Full pass model — multi-pass, scale types, feedback/history, textures, per-pass formats |
+| 4 | **Done.** Full pass model — multi-pass, scale types, feedback/history, textures, per-pass formats. `tests/chain_test.cpp` builds and records every preset in the catalogue with no game and no window |
 | 5 | Qt GUI — preset tree, parameters, profiles, status, screenshot view |
 | 6 | Source resolution, pixel size and output policy, aspect ratio, crop, flip/rotate, frame skip, pause, idle repaint, the gamescope launch helper |
-| 7 | Packaging, docs, `RELICENSE.md`, PR preparation |
+| 7 | Packaging, docs, `RELICENSE.md`, PR preparation. Every package's build runs `tools/build-catalogue.sh`, which is what guarantees the shader patches reach an installed catalogue |
 
 ---
 
@@ -270,6 +313,26 @@ lost; what goes is capture and window management, which is exactly what the laye
   generated tree is 269 MB over 4741 files, compiling in 5.6 s wall (32-way) to a **134 MB**
   `libShaderGlassPresets.so`. It is `dlopen`ed rather than linked into the layer, so game processes
   pay for it only when a preset is selected. Splitting it into its own package stays available.
+- **A driver's shader compiler can segfault, and it takes the game with it.** `crt/simple-crt` and
+  `crt/simple-crt-fxaa` did: `vkCreateGraphicsPipelines` crashed inside `libnvidia-gpucomp` on
+  driver 615.71.09, on SPIR-V that `spirv-val` accepts and whose stage interfaces match exactly.
+  Reproduced in a 130-line program with none of this layer's code involved.
+
+  Bisected to `precision mediump float;` — a GLSL ES qualifier in a `#version 450` shader, which
+  glslang turns into `RelaxedPrecision` decorations. Removing them from the **vertex** stage alone
+  avoids the crash; removing them from the fragment stage does not. So the generator now strips
+  them from every vertex stage (`gen/spirv_edit.cpp`): `RelaxedPrecision` is a hint that full
+  precision always satisfies, and a fullscreen-quad pass runs its vertex shader over four vertices
+  a frame, where relaxing precision cannot buy anything measurable. The fragment stage, where it
+  might, keeps its decorations. Across the whole tree exactly three shaders change — the
+  `simple-crt` family, the only vertex stages carrying the decoration — and both presets now run.
+
+  This is a workaround for one driver bug, not a guarantee against the next one. Nothing here can
+  catch a SIGSEGV inside a driver; `chain_test --isolate` is what finds them.
+- **Fifteen upstream shaders declare a fragment input their vertex stage never writes**, so its
+  value is undefined and the Vulkan runtime reports `VUID-RuntimeSpirv-OpEntryPoint-08743` when the
+  pipeline is built. `2xsal`, `crt-hyllian-pass0`, `crt-gdv-mini` and the rest are authored that way
+  upstream. `shaderglass-gen` now warns for each rather than letting it first appear inside a game.
 - **Shaders authored against a low-res source** will look wrong at Native until the source resolution
   is set. Documented, not solvable.
 - **`VK_FORMAT` coverage.** Presets request float and sRGB pass formats; devices that cannot render

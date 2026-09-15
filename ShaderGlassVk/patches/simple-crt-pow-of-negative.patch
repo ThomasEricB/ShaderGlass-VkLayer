@@ -1,0 +1,37 @@
+Fix simple-crt.slang raising a negative number to a power
+
+pow(x, y) is undefined in GLSL for x < 0, and simple-crt.slang applies it to
+`diff`, which is negative for every pixel darker than LUMA_THRESHOLD (0.5 by
+default):
+
+    const float diff = luma - LUMA_THRESHOLD;
+    color = mix(color, color * (...), pow(diff, 3.0)) * float(diff > 0.0)
+          + color * float(diff <= 0.0);
+
+The `float(diff > 0.0)` factor is clearly meant to discard that branch when
+diff is negative -- but it cannot, because multiplying a NaN by zero is still
+NaN, and adding it to the other branch poisons the result. On a driver whose
+pow() returns a finite value for a negative base the shader happens to work;
+on one that returns NaN (NVIDIA's Vulkan compiler does) every pixel below the
+threshold comes out black.
+
+With the stock parameters that is luma < 0.5, so pure red (0.299), blue
+(0.114) and magenta (0.413) vanish entirely while green (0.587), yellow
+(0.886) and cyan (0.701) survive -- about 88% of a typical frame.
+
+Clamping the base leaves the intended path untouched (diff > 0 is unaffected)
+and makes the discarded path produce 0 rather than NaN.
+
+Reported upstream; this patch is here so the preset is usable meanwhile.
+
+--- a/crt/shaders/simple-crt/simple-crt.slang
++++ b/crt/shaders/simple-crt/simple-crt.slang
+@@ -192,7 +192,7 @@
+ 	// ca.a is the luma of the current and surrounding pixels, prepared by simple_color_correction.slang
+ 	const float luma = ca.a; // dot(color, vec3(0.299,0.587,0.114));
+ 	const float diff = luma - LUMA_THRESHOLD;
+-	color = mix(color, color * (luma * LUMA_INTENSITY + 1.0), pow(diff, 3.0)) * float(diff > 0.0) + color * float(diff <= 0.0);
++	color = mix(color, color * (luma * LUMA_INTENSITY + 1.0), pow(max(diff, 0.0), 3.0)) * float(diff > 0.0) + color * float(diff <= 0.0);
+ 	
+ 	
+ 	// simple CRT mask

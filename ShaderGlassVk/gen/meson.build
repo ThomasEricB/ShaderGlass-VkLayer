@@ -10,6 +10,7 @@ glslang_res_dep = cpp.find_library('glslang-default-resource-limits', required: 
 gen_sources = files(
   'main.cpp',
   'shadergc.cpp',
+  'spirv_edit.cpp',
   'glsl.cpp',
   'reflect_builtin.cpp',
 )

@@ -21,6 +21,17 @@ exactly as it did before.
 
 Needs a C++17 compiler, Vulkan headers, and Meson or CMake.
 
+Two optional headers, each detected at configure time, each degrading to something that still works:
+
+| | For | Without it |
+|---|---|---|
+| `stb_image.h` (Arch `stb`, Debian `libstb-dev`, Fedora `stb_devel`) | Decoding preset textures — LUTs, bezels, overlays | Presets run, minus their textures |
+| SPIRV-Cross | The generator's primary reflection backend | The built-in SPIR-V reader is used instead |
+
+stb_image is header-only, so it adds nothing to what the layer links against — worth caring about for
+a library mapped into every game on the system. If you add it to an existing build tree, CMake caches
+the earlier negative result: configure a fresh one, or `meson setup --clearcache --reconfigure`.
+
 ```bash
 meson setup build/native --native-file meson/native-clang.ini
 meson compile -C build/native
@@ -84,19 +95,69 @@ A half-texel sampling offset — the classic error in a pass like this — fails
 is worth running after any change to the quad, the MVP or the sampler. Running under
 `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation` at the same time covers the API side.
 
+(With no preset selected the frame is passed through untouched and the chain is not run at all, so
+`SHADERGLASS_SELFTEST=1` is also what turns the passthrough on in the first place.)
+
+### Every preset, with no game and no window
+
+A game proves a handful of presets a few seconds at a time, which will not find the preset whose
+eleventh pass wants a format the device will not render to. `chain_test` creates a device, hands the
+chain an ordinary image where the swapchain's would go, and builds and records every preset in a
+catalogue:
+
+```bash
+SHADERGLASS_PRESETS=build/catalog/cm/libShaderGlassPresets.so \
+VK_LOADER_LAYERS_ENABLE=VK_LAYER_KHRONOS_validation \
+  ./build/native/tools/chain_test
+
+# chain_test [--stride N] [--limit N] [--width W] [--height H] [preset-id ...]
+```
+
+Each preset is recorded twice, so feedback passes have a previous frame to read and the history ring
+turns over. `semantics_test` covers the libretro naming rules on their own, with no device at all:
+
+```bash
+meson test -C build/native
+```
+
 ## Compiling presets
 
 `shaderglass-gen` is ShaderGen's job done for Vulkan. It compiles libretro `.slangp` presets to
 SPIR-V and emits generated C — one `.cpp` per preset plus an index — which builds into
-`libShaderGlassPresets.so`:
+`libShaderGlassPresets.so`.
+
+Build the whole catalogue with one command. **This is the step a package's build runs**, and the one
+to use rather than calling the generator by hand, because it also applies the shader patches — see
+below:
 
 ```bash
-# one preset, or a whole slang-shaders tree
-./build/native/gen/shaderglass-gen --out build/catalog --tree /path/to/slang-shaders
+tools/build-catalogue.sh                        # clones into build/slang-shaders
+tools/build-catalogue.sh /path/to/slang-shaders # or use a tree you already have
 
-cd build/catalog && cmake -B cm -S . && cmake --build cm -j
-./build/native/catalog_test build/catalog/cm/libShaderGlassPresets.so crt/crt-geom
+./build/native/tools/catalog_test build/catalog/cm/libShaderGlassPresets.so crt/crt-geom
 ```
+
+The generator can still be driven directly for one preset or a subtree, which is what you want while
+working on a shader:
+
+```bash
+./build/native/gen/shaderglass-gen --out build/catalog --tree /path/to/slang-shaders
+```
+
+### Shader patches
+
+A few shaders in the libretro tree are broken as written rather than merely different from what we
+would do, and `patches/` carries a fix for each with its reasoning in the patch header. They are not
+cosmetic: `crt/simple-crt` raises a negative number to a power, which is undefined in GLSL, and on a
+driver whose `pow()` returns NaN for a negative base — NVIDIA's Vulkan compiler does — roughly 88 %
+of every frame comes out black.
+
+`tools/build-catalogue.sh` applies them, and stops rather than generating from an unpatched tree, so
+a shipped catalogue cannot quietly be missing them. The tree is modified in place; the patches are
+idempotent and `tools/patch-shaders.sh --revert <tree>` takes them back out.
+
+A patch that no longer applies is reported as a failure rather than skipped — usually it means the
+shader was fixed upstream, and the patch should be dropped from `patches/`.
 
 The catalogue is its own shared object rather than part of the layer, because the layer is mapped
 into every game that has ShaderGlass armed and a game with no preset selected should pay nothing for
@@ -141,7 +202,8 @@ DLSS5VKLayer, which had to ship every frame to a Windows helper and wait for it 
 | `SHADERGLASS_LOG` | Log file. Defaults to stderr |
 | `SHADERGLASS_VERBOSE=1` | Log every present |
 | `SHADERGLASS_TIME=1` | Periodic frame-count lines |
-| `SHADERGLASS_SELFTEST=1` | Compare the pass's output against its input once and log whether they match |
+| `SHADERGLASS_SELFTEST=1` | Run the chain with no preset and compare its output against its input once, logging whether they match |
+| `SHADERGLASS_PRESETS` | Path to `libShaderGlassPresets.so`. Without it the normal loader search runs, which is what a packaged install wants |
 
 The mapping lives under `/tmp` rather than `$XDG_RUNTIME_DIR` on purpose: a Steam game runs inside
 pressure-vessel, which gives the container a private tmpfs there, so a mapping put in it is simply

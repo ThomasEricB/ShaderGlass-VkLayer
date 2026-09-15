@@ -45,13 +45,38 @@ else()
   set(SG_LAYER_DEFINE)
 endif()
 
-add_library(${SG_LAYER_NAME} SHARED layer/src/layer.cpp layer/src/chain.cpp)
+add_library(${SG_LAYER_NAME} SHARED
+  layer/src/layer.cpp
+  layer/src/chain.cpp
+  layer/src/catalogue.cpp
+  layer/src/semantics.cpp
+  layer/src/texture.cpp)
 
-target_include_directories(${SG_LAYER_NAME} PRIVATE layer/src common ${SG_VULKAN_INCLUDE})
+target_include_directories(${SG_LAYER_NAME} PRIVATE layer/src common presets ${SG_VULKAN_INCLUDE})
 target_link_libraries(${SG_LAYER_NAME} PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
 
 if(SG_LAYER_DEFINE)
   target_compile_definitions(${SG_LAYER_NAME} PRIVATE ${SG_LAYER_DEFINE})
+endif()
+
+# Preset textures are PNG and JPEG, decoded when a preset is selected. stb_image is header-only, so
+# this adds nothing to what the layer links against -- which matters for a library mapped into every
+# game. Distributions spell the include path differently; without it the layer still builds and
+# every other part of a preset still runs, minus its textures.
+include(CheckIncludeFileCXX)
+check_include_file_cxx("stb/stb_image.h" SG_STB_IN_SUBDIR)
+if(SG_STB_IN_SUBDIR)
+  target_compile_definitions(${SG_LAYER_NAME} PRIVATE
+    SG_HAVE_STB_IMAGE "SG_STB_IMAGE_HEADER=<stb/stb_image.h>")
+else()
+  check_include_file_cxx("stb_image.h" SG_STB_BARE)
+  if(SG_STB_BARE)
+    target_compile_definitions(${SG_LAYER_NAME} PRIVATE
+      SG_HAVE_STB_IMAGE "SG_STB_IMAGE_HEADER=<stb_image.h>")
+  else()
+    message(WARNING
+      "stb_image.h not found: presets will run without their textures (LUTs, bezels, overlays)")
+  endif()
 endif()
 
 # Only the loader's entry points leave this object; see layer/shaderglass.map for why that matters.
@@ -73,6 +98,7 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
     set(SG_GEN_SOURCES
       gen/main.cpp
       gen/shadergc.cpp
+    gen/spirv_edit.cpp
       gen/glsl.cpp
       gen/reflect_builtin.cpp)
 
@@ -104,6 +130,15 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
   # Reads a generated catalogue the way the layer will, through dlopen.
   add_executable(catalog_test tests/catalog_test.cpp)
   target_link_libraries(catalog_test PRIVATE ${CMAKE_DL_LIBS})
+
+  # The libretro vocabulary, checked without a device.
+  add_executable(semantics_test tests/semantics_test.cpp layer/src/semantics.cpp)
+  target_include_directories(semantics_test PRIVATE layer/src)
+  add_test(NAME semantics COMMAND semantics_test)
+
+  # The SPIR-V decoration edit, on modules built by hand.
+  add_executable(spirv_edit_test tests/spirv_edit_test.cpp gen/spirv_edit.cpp)
+  add_test(NAME spirv_edit COMMAND spirv_edit_test)
 endif()
 
 # --- the control tool --------------------------------------------------------

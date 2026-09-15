@@ -461,7 +461,7 @@ bool CreateSwapchainResources(DeviceChain* dc, SwapchainState& sc, uint32_t fami
 // Every path out leaves the swapchain image in PRESENT_SRC_KHR, including the ones that give up.
 bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue, VkImage image,
                     uint32_t waitCount, const VkSemaphore* waits, uint32_t sourceW,
-                    uint32_t sourceH) {
+                    uint32_t sourceH, const std::string& presetId) {
     // The previous frame's chain, if it is still running, must finish before anything here touches
     // the surfaces it reads or the command buffer it was recorded into.
     if (sc.fencePending) {
@@ -471,11 +471,22 @@ bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue, VkImage 
         dc->table.vkResetFences(dc->self, 1, &sc.fence);
         sc.fencePending = false;
 
-        // The readback the previous frame recorded has landed with that fence.
-        sc.chain->ConsumeSelfTest();
+        // That fence retiring is what lets the chain release what the previous frame was still
+        // using, and read back what it recorded.
+        sc.chain->FrameCompleted();
     }
 
-    if (!sc.chain->Prepare(sc.width, sc.height, sc.format, sourceW, sourceH)) return false;
+    if (!sc.chain->Prepare(sc.width, sc.height, sc.format, sourceW, sourceH, presetId))
+        return false;
+
+    // Parameter values are read every frame rather than watched, because they are cheap to read and
+    // the alternative is a second sequence number to get wrong. Prepare has already folded in the
+    // preset's own defaults, so this only moves what the interface has changed.
+    if (dc->shm.hdr) {
+        const uint32_t count =
+            std::min(dc->shm.hdr->paramCount.load(std::memory_order_relaxed), kMaxParams);
+        sc.chain->ApplyParameters(dc->shm.hdr->params, count);
+    }
 
     VkCommandBufferBeginInfo bi {};
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -897,7 +908,14 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
     // Phase 2 has no catalogue yet, so any preset id selects the built-in passthrough. What is being
     // proved here is the path, not the picture: the frame goes swapchain -> source raster -> one
     // real graphics pass -> swapchain, through the same executor phase 4 will run presets on.
-    const bool wantChain = enabled && !paused && !preset.empty();
+    // No preset means the frame goes through untouched (decision 13), so the chain is not run at
+    // all. The self-test is the exception: what it proves is that the passthrough reproduces the
+    // frame exactly, which is only observable when the chain runs without a preset.
+    static const bool selfTest = [] {
+        const char* p = getenv("SHADERGLASS_SELFTEST");
+        return p && p[0] == '1';
+    }();
+    const bool wantChain = enabled && !paused && (!preset.empty() || selfTest);
 
     uint32_t family = 0;
     if (auto qit = dc->queueFamilies.find(queue); qit != dc->queueFamilies.end())
@@ -931,12 +949,13 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
             if (sc.resourcesReady) {
                 uint32_t sourceW = 0, sourceH = 0;
                 ShmSourceExtent(dc->shm.hdr, sc.width, sc.height, &sourceW, &sourceH);
+                const std::string presetId = ShmPresetId(dc->shm.hdr);
 
                 const uint32_t waitCount =
                     waitsConsumed ? 0u : pPresentInfo->waitSemaphoreCount;
                 composed = ProcessPresent(dc, sc, queue, sc.images[pPresentInfo->pImageIndices[i]],
                                           waitCount, pPresentInfo->pWaitSemaphores, sourceW,
-                                          sourceH);
+                                          sourceH, presetId);
 
                 // Set whether or not the chain succeeded: the submit waits on them before anything
                 // can fail, so they are consumed either way.
