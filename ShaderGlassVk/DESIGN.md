@@ -83,6 +83,7 @@ so recording a frame never compares a string.
 | **A declared pass format that the device cannot render to falls back to the chain's format — unless it is an integer format**, which fails the chain instead | Found by `test/format`: `#pragma format R32_UINT` is read back through a `usampler2D`, so substituting a UNORM image is a type error the shader cannot survive, not a loss of precision |
 | **A sampler that resolves to nothing binds the frame** | An unwritten descriptor is undefined behaviour; a wrong-looking pass is better than a crash inside someone's game |
 | **`<Alias>Feedback` resolves to that pass's previous frame**, and `OriginalFeedback` to `OriginalHistory1` | Sixty-odd libretro shaders spell feedback by alias rather than by index — `AfterglowPassFeedback`, `AvgLumPassFeedback`. Reading them as ordinary texture names is not an error anyone sees: the pass silently samples the current frame, which is a feedback loop with no delay. Finding this took counting feedback passes in the build log — a Mega Bezel preset reported 0 and should have reported 6 |
+| **`OriginalFPS` reports the game's presentation rate, smoothed, and never zero** | It is the rate a libretro core runs its content at, and shaders derive line counts and colour-carrier timing by dividing by it. Left unimplemented it is a silent zero, and the whole `bezel/scanline-classic` family — every composite preset in it — turns to NaN at the demodulator and renders black. Smoothed because a rate that jitters frame to frame makes the picture jitter with it |
 | **`FrameTimeDelta`, `OriginalAspect`, `OriginalAspectRotated`, `TotalSubFrames`, `CurrentSubFrame` and `Rotation` are filled in** | They are uniform-block members like any other, so an unhandled one is not a failure — it is a silent zero. Zero freezes anything integrating over frame time, and `TotalSubFrames` of zero is a divide waiting to happen. This layer composes once per present, so subframes are always 1 of 1 |
 | **A `<Something>Size` that names nothing the preset declared keeps its parameter value** instead of reporting the frame's size | A shader parameter may end in "Size" too (`FrameHSize`), and there is no way to tell from the name. A sampler must be bound to something valid, so that path still substitutes the frame; a size can honestly stay what it was |
 | **`mipmap_input` builds a real mip chain**, on pass outputs, on Original and on preset textures | 1645 presets set it and 2568 pass declarations turn it on — roughly half the catalogue. Without it a glow or bloom pass samples level 0 everywhere, which does not fail, it just quietly looks wrong. A mipmapped pass needs a second image view over level 0 alone, because a framebuffer attachment may not span a chain |
@@ -104,10 +105,18 @@ and it is what packaging calls — so a catalogue that reaches a user cannot be 
 that no longer applies is a failure, not a skip, because the likeliest reason is that the shader was
 fixed upstream and the patch should go.
 
-So far there is one: `crt/simple-crt` raises a negative number to a power. `pow(x, y)` is undefined
+Both so far are the same mistake: a shader raising a negative number to a power. `pow(x, y)` is
+undefined in GLSL for `x < 0`, and NVIDIA's Vulkan compiler returns NaN, which then survives every
+guard the shader puts around it — `NaN * 0.0` is still NaN.
+
+`crt/simple-crt` raises a negative number to a power. `pow(x, y)` is undefined
 in GLSL for `x < 0`, the shader's `* float(diff > 0.0)` guard cannot discard the result because
 NaN × 0 is still NaN, and on NVIDIA's Vulkan compiler about 88 % of every frame comes out black —
 every pixel whose luma falls below the shader's threshold.
+
+`bezel/scanline-classic`'s `limiter.slang` does the same to a composite signal's sub-black
+excursions: its gamma guard is `color.r < 1.0`, meant to leave extended values above 1.0 alone,
+which also admits the values below zero the same signal carries deliberately.
 
 ### Decisions taken without asking, and why
 

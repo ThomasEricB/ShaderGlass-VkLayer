@@ -83,6 +83,21 @@ class Chain {
     void FrameCompleted();
 
     uint32_t PassCount() const { return uint32_t(_passes.size()); }
+
+    // What a pass wrote, for tools that want to look inside the chain. A signal chain -- NTSC
+    // encode, DAC, demodulate -- carries values that are not an image until the last pass decodes
+    // them, so "the final frame is black" says nothing about which pass broke it.
+    struct PassInfo {
+        const char* name = "";
+        VkImage image = VK_NULL_HANDLE;
+        uint32_t width = 0, height = 0;
+        VkFormat format = VK_FORMAT_UNDEFINED;
+        VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        uint32_t levels = 1;
+        bool feedback = false;
+        const char* alias = "";
+    };
+    PassInfo PassAt(uint32_t index) const;
     uint32_t OutputWidth() const { return _swapWidth; }
     uint32_t OutputHeight() const { return _swapHeight; }
     uint32_t SourceWidth() const { return _sourceWidth; }
@@ -256,6 +271,12 @@ class Chain {
     // What FrameTimeDelta reports, and what it is measured against.
     double _lastFrameMs = 0.0;
     uint32_t _frameTimeDeltaUs = 0;
+
+    // What OriginalFPS reports. Smoothed, because the shaders that read it use it to derive line
+    // counts and carrier timing, and a rate that jitters frame to frame makes the picture jitter
+    // with it. 60 until there is enough to measure.
+    double _smoothedFrameMs = 0.0;
+    float _originalFps = 60.0f;
 
     // Samplers are shared across passes: there are only eight combinations and a preset that uses
     // all of them still wants one object each.

@@ -1,0 +1,39 @@
+Fix limiter.slang raising a negative number to a power
+
+pow(x, y) is undefined in GLSL for x < 0. limiter.slang applies a gamma to
+every channel below 1.0:
+
+    // Preserve extended values for proper handling
+    if (color.r < 1.0)
+        color.r = pow(color.r, gamma);
+
+The guard is there to leave values above 1.0 alone -- a composite signal
+carries them deliberately -- but it also admits values below *zero*, which
+the same signal carries just as deliberately (sub-black). gamma is
+fractional, so those become NaN: about 12% of the frame in the
+scanline-classic composite presets, whose limiter pass receives a range of
+roughly [-0.26 .. 1.22].
+
+Extending the guard at the bottom end preserves the stated intent -- gamma
+applies to the normal range, extended values pass through -- and leaves the
+negative excursions intact rather than clamping them away.
+
+Reported upstream; this patch is here so the presets are usable meanwhile.
+
+--- a/bezel/scanline-classic/shaders/limiter.slang
++++ b/bezel/scanline-classic/shaders/limiter.slang
+@@ -392,11 +392,11 @@
+     float gamma = (2.4 - USER_GAMMA / 10.0) / 2.4; // Map USER_GAMMA 0-1 to fraction of 2.4
+ 
+     // Preserve extended values for proper handling
+-    if (color.r < 1.0)
++    if (color.r > 0.0 && color.r < 1.0)
+         color.r = pow(color.r, gamma);
+-    if (color.g < 1.0)
++    if (color.g > 0.0 && color.g < 1.0)
+         color.g = pow(color.g, gamma);
+-    if (color.b < 1.0)
++    if (color.b > 0.0 && color.b < 1.0)
+         color.b = pow(color.b, gamma);
+ 
+     // Debug: Visualize out-of-range colors with zebra pattern

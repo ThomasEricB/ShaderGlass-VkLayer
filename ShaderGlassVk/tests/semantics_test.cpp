@@ -100,6 +100,7 @@ int main() {
     CheckUniform("FinalViewportSize", UniformSemantic::kFinalViewportSize);
     CheckUniform("Rotation", UniformSemantic::kRotation);
     CheckUniform("FrameTimeDelta", UniformSemantic::kFrameTimeDelta);
+    CheckUniform("OriginalFPS", UniformSemantic::kOriginalFPS);
     CheckUniform("OriginalAspect", UniformSemantic::kOriginalAspect);
     CheckUniform("OriginalAspectRotated", UniformSemantic::kOriginalAspectRotated);
     CheckUniform("TotalSubFrames", UniformSemantic::kTotalSubFrames);

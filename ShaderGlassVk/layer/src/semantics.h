@@ -63,6 +63,7 @@ enum class UniformSemantic {
     kFrameDirection,
     kRotation,       // 0..3, quarter turns of the output
     kFrameTimeDelta, // microseconds since the previous frame
+    kOriginalFPS,    // the rate the content is presented at
     kOriginalAspect, // Original's width over its height
     kOriginalAspectRotated,
     kTotalSubFrames, // subframe rendering, which this layer does not do: always 1 of 1

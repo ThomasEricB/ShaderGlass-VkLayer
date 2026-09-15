@@ -1190,6 +1190,16 @@ void Chain::WriteUniforms(Pass& pass, size_t passIndex, uint64_t frameCount, con
                 break;
             }
 
+            case UniformSemantic::kOriginalFPS: {
+                // The rate the content runs at. libretro cores report their own; here the game's
+                // presentation rate is the same thing. It must never be zero -- the shaders that
+                // read it divide by it, and one of them (scanline-classic's composite chain)
+                // turns the whole picture into NaN when it is.
+                const float value = _originalFps > 0.0f ? _originalFps : 60.0f;
+                if (slot.size >= sizeof(value)) std::memcpy(base + slot.offset, &value, sizeof(value));
+                break;
+            }
+
             case UniformSemantic::kOriginalAspect:
             case UniformSemantic::kOriginalAspectRotated: {
                 // Rotated and unrotated are the same until the output controls arrive in phase 6;
@@ -1379,9 +1389,15 @@ bool Chain::Record(VkCommandBuffer cb, VkImage swapchainImage, uint64_t frameCou
     // What FrameTimeDelta reports. Measured here rather than passed in, because this is the only
     // point in the layer that runs exactly once per composed frame.
     const double nowMs = NowMs();
-    _frameTimeDeltaUs =
-        _lastFrameMs > 0.0 ? uint32_t((nowMs - _lastFrameMs) * 1000.0) : 0u;
+    const double deltaMs = _lastFrameMs > 0.0 ? nowMs - _lastFrameMs : 0.0;
+    _frameTimeDeltaUs = uint32_t(deltaMs * 1000.0);
     _lastFrameMs = nowMs;
+
+    // A plausible interval only; a frame the game spent loading is not a refresh rate.
+    if (deltaMs > 0.5 && deltaMs < 200.0) {
+        _smoothedFrameMs = _smoothedFrameMs > 0.0 ? _smoothedFrameMs * 0.9 + deltaMs * 0.1 : deltaMs;
+        _originalFps = float(1000.0 / _smoothedFrameMs);
+    }
 
     // ---- the frame, as the game presented it ----
     TransitionForeign(_vk, cb, swapchainImage, externalLayout,
@@ -1549,6 +1565,24 @@ bool Chain::Record(VkCommandBuffer cb, VkImage swapchainImage, uint64_t frameCou
         if (pass.feedback) pass.current = 1 - pass.current;
 
     return true;
+}
+
+Chain::PassInfo Chain::PassAt(uint32_t index) const {
+    PassInfo info;
+    if (index >= _passes.size()) return info;
+
+    const Pass& pass = _passes[index];
+    const Image& img = pass.output[pass.current];
+    info.name = pass.name.c_str();
+    info.image = img.image;
+    info.width = img.width;
+    info.height = img.height;
+    info.format = img.format;
+    info.layout = img.layout;
+    info.levels = img.levels;
+    info.feedback = pass.feedback;
+    info.alias = pass.alias.c_str();
+    return info;
 }
 
 void Chain::FrameCompleted() {

@@ -131,6 +131,10 @@ UniformRef ClassifyUniform(const std::string& name) {
         ref.semantic = UniformSemantic::kFrameTimeDelta;
         return ref;
     }
+    if (name == "OriginalFPS") {
+        ref.semantic = UniformSemantic::kOriginalFPS;
+        return ref;
+    }
     if (name == "OriginalAspect") {
         ref.semantic = UniformSemantic::kOriginalAspect;
         return ref;

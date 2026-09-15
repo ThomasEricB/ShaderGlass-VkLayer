@@ -152,6 +152,9 @@ cosmetic: `crt/simple-crt` raises a negative number to a power, which is undefin
 driver whose `pow()` returns NaN for a negative base — NVIDIA's Vulkan compiler does — roughly 88 %
 of every frame comes out black.
 
+`bezel/scanline-classic`'s `limiter.slang` has the same fault applied to a composite signal's
+sub-black excursions.
+
 `tools/build-catalogue.sh` applies them, and stops rather than generating from an unpatched tree, so
 a shipped catalogue cannot quietly be missing them. The tree is modified in place; the patches are
 idempotent and `tools/patch-shaders.sh --revert <tree>` takes them back out.

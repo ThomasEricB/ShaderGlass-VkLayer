@@ -39,6 +39,7 @@ restarts it past whatever killed it, so one such preset does not hide the rest.
 #include <sys/wait.h>
 #include <unistd.h>
 #include <cstdio>
+#include <algorithm>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -224,6 +225,95 @@ void FillPattern(uint8_t* bgra, uint32_t w, uint32_t h) {
     }
 }
 
+// Decode one texel of the formats a preset's passes actually use, to float RGBA. Enough to tell a
+// signal from a black screen, which is all this is for.
+bool DecodeTexel(VkFormat f, const uint8_t* p, float* rgba, uint32_t* texelBytes) {
+    const auto half = [](uint16_t h) {
+        const uint32_t sign = uint32_t(h >> 15) << 31;
+        uint32_t exp = (h >> 10) & 0x1F;
+        uint32_t man = h & 0x3FF;
+        uint32_t bits;
+        if (exp == 0) {
+            if (man == 0) { bits = sign; }
+            else {  // subnormal: renormalise
+                exp = 127 - 15 + 1;
+                while ((man & 0x400) == 0) { man <<= 1; --exp; }
+                man &= 0x3FF;
+                bits = sign | (exp << 23) | (man << 13);
+            }
+        } else if (exp == 0x1F) {
+            bits = sign | 0x7F800000u | (man << 13);  // inf / NaN
+        } else {
+            bits = sign | ((exp - 15 + 127) << 23) | (man << 13);
+        }
+        float out;
+        std::memcpy(&out, &bits, sizeof(out));
+        return out;
+    };
+
+    switch (f) {
+        case VK_FORMAT_B8G8R8A8_UNORM:
+        case VK_FORMAT_B8G8R8A8_SRGB:
+            rgba[0] = p[2] / 255.0f; rgba[1] = p[1] / 255.0f;
+            rgba[2] = p[0] / 255.0f; rgba[3] = p[3] / 255.0f;
+            *texelBytes = 4;
+            return true;
+        case VK_FORMAT_R8G8B8A8_UNORM:
+        case VK_FORMAT_R8G8B8A8_SRGB:
+            for (int i = 0; i < 4; ++i) rgba[i] = p[i] / 255.0f;
+            *texelBytes = 4;
+            return true;
+        case VK_FORMAT_A2B10G10R10_UNORM_PACK32: {
+            uint32_t v;
+            std::memcpy(&v, p, sizeof(v));
+            rgba[0] = float(v & 0x3FF) / 1023.0f;
+            rgba[1] = float((v >> 10) & 0x3FF) / 1023.0f;
+            rgba[2] = float((v >> 20) & 0x3FF) / 1023.0f;
+            rgba[3] = float((v >> 30) & 0x3) / 3.0f;
+            *texelBytes = 4;
+            return true;
+        }
+        case VK_FORMAT_R16G16B16A16_SFLOAT: {
+            for (int i = 0; i < 4; ++i) {
+                uint16_t h;
+                std::memcpy(&h, p + i * 2, sizeof(h));
+                rgba[i] = half(h);
+            }
+            *texelBytes = 8;
+            return true;
+        }
+        case VK_FORMAT_R16G16B16A16_UNORM: {
+            for (int i = 0; i < 4; ++i) {
+                uint16_t v;
+                std::memcpy(&v, p + i * 2, sizeof(v));
+                rgba[i] = v / 65535.0f;
+            }
+            *texelBytes = 8;
+            return true;
+        }
+        case VK_FORMAT_R32G32B32A32_SFLOAT:
+            std::memcpy(rgba, p, sizeof(float) * 4);
+            *texelBytes = 16;
+            return true;
+        default:
+            return false;
+    }
+}
+
+const char* FormatName(VkFormat f) {
+    switch (f) {
+        case VK_FORMAT_B8G8R8A8_UNORM: return "BGRA8";
+        case VK_FORMAT_R8G8B8A8_UNORM: return "RGBA8";
+        case VK_FORMAT_B8G8R8A8_SRGB: return "BGRA8_SRGB";
+        case VK_FORMAT_R8G8B8A8_SRGB: return "RGBA8_SRGB";
+        case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return "A2B10G10R10";
+        case VK_FORMAT_R16G16B16A16_SFLOAT: return "RGBA16F";
+        case VK_FORMAT_R16G16B16A16_UNORM: return "RGBA16";
+        case VK_FORMAT_R32G32B32A32_SFLOAT: return "RGBA32F";
+        default: return "?";
+    }
+}
+
 void WritePpm(const char* path, const uint8_t* bgra, uint32_t w, uint32_t h) {
     FILE* f = std::fopen(path, "wb");
     if (!f) return;
@@ -237,7 +327,7 @@ void WritePpm(const char* path, const uint8_t* bgra, uint32_t w, uint32_t h) {
 
 int RunRange(const std::vector<std::string>& ids, size_t from, uint32_t width, uint32_t height,
              bool verbose, int progress, size_t* built, size_t* failed,
-             const std::string& dumpDir) {
+             const std::string& dumpDir, bool stats) {
     Device d;
     if (!CreateDevice(d)) return 2;
 
@@ -258,9 +348,13 @@ int RunRange(const std::vector<std::string>& ids, size_t from, uint32_t width, u
 
     // Host-visible scratch the size of the image, for putting the pattern in and reading the
     // result back out. Only needed when dumping.
+    // Both --dump and --stats need a real picture going in: measuring what a chain does to an
+    // image it was never given is measuring nothing, and every pass dutifully reports black.
+    const bool wantPattern = !dumpDir.empty() || stats;
+
     HostBuffer scratch {};
     const VkDeviceSize imageBytes = VkDeviceSize(width) * height * 4;
-    if (!dumpDir.empty() &&
+    if (wantPattern &&
         !MakeHostBuffer(&d.deviceTable, &d.instanceTable, d.device, d.physical, scratch, imageBytes,
                         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
         std::fprintf(stderr, "could not allocate the readback buffer\n");
@@ -313,27 +407,28 @@ int RunRange(const std::vector<std::string>& ids, size_t from, uint32_t width, u
             // chain may only release what a frame was using once that frame's fence has retired,
             // and FrameCompleted is where it does it. Two frames rather than one so a feedback
             // pass has a previous frame to read and the history ring turns over.
-            // Each preset starts from the same picture, so what comes out is comparable. The
-            // pattern is re-laid every time because the readback below lands in this same buffer:
-            // without this, every preset after the first is fed its predecessor's output, and a
-            // run of dark shaders fades the whole survey to black -- which looks exactly like a
-            // catastrophic chain bug and is not one.
-            if (!dumpDir.empty()) {
-                FillPattern((uint8_t*) scratch.mapped, width, height);
-                d.deviceTable.vkBeginCommandBuffer(d.cb, &begin);
-                Transition(&d.deviceTable, d.cb, external, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-                VkBufferImageCopy r {};
-                r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-                r.imageExtent = {width, height, 1};
-                d.deviceTable.vkCmdCopyBufferToImage(d.cb, scratch.buffer, external.image,
-                                                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
-                Transition(&d.deviceTable, d.cb, external, VK_IMAGE_LAYOUT_GENERAL);
-                d.deviceTable.vkEndCommandBuffer(d.cb);
-                submitAndWait();
-            }
-
             bool ok = true;
             for (uint64_t frame = 1; frame <= 2 && ok; ++frame) {
+                // Before *every* frame, not merely every preset. The chain copies its result back
+                // into this image, exactly as it does to a real swapchain -- but a game renders a
+                // fresh frame each time and nothing here does, so without re-laying the pattern the
+                // second frame is fed the first frame's output. A long chain then looks like it
+                // fades to black, and the fade is the harness, not the chain.
+                if (wantPattern) {
+                    FillPattern((uint8_t*) scratch.mapped, width, height);
+                    d.deviceTable.vkBeginCommandBuffer(d.cb, &begin);
+                    Transition(&d.deviceTable, d.cb, external, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                    VkBufferImageCopy up {};
+                    up.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                    up.imageExtent = {width, height, 1};
+                    d.deviceTable.vkCmdCopyBufferToImage(d.cb, scratch.buffer, external.image,
+                                                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                                                         &up);
+                    Transition(&d.deviceTable, d.cb, external, VK_IMAGE_LAYOUT_GENERAL);
+                    d.deviceTable.vkEndCommandBuffer(d.cb);
+                    submitAndWait();
+                }
+
                 VkCommandBufferBeginInfo bi {};
                 bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
                 bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -365,6 +460,105 @@ int RunRange(const std::vector<std::string>& ids, size_t from, uint32_t width, u
                 d.deviceTable.vkWaitForFences(d.device, 1, &d.fence, VK_TRUE, UINT64_MAX);
                 d.deviceTable.vkResetFences(d.device, 1, &d.fence);
                 chain.FrameCompleted();
+            }
+
+            // Per-pass statistics, which is what tells you where a chain went wrong. A signal
+            // chain's intermediate passes are not images, so this reports ranges and NaN counts
+            // rather than writing pictures nobody can read.
+            if (ok && stats) {
+                std::printf("  %s\n", id.c_str());
+                for (uint32_t pi = 0; pi < chain.PassCount(); ++pi) {
+                    const Chain::PassInfo info = chain.PassAt(pi);
+                    if (!info.image) continue;
+
+                    const VkDeviceSize need = VkDeviceSize(info.width) * info.height * 16;
+                    HostBuffer rb {};
+                    if (!MakeHostBuffer(&d.deviceTable, &d.instanceTable, d.device, d.physical, rb,
+                                        need, VK_BUFFER_USAGE_TRANSFER_DST_BIT))
+                        continue;
+
+                    d.deviceTable.vkBeginCommandBuffer(d.cb, &begin);
+                    VkImageMemoryBarrier b {};
+                    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                    b.oldLayout = info.layout;
+                    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    b.image = info.image;
+                    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                    b.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                    b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                    d.deviceTable.vkCmdPipelineBarrier(d.cb, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
+                                                       0, nullptr, 1, &b);
+
+                    VkBufferImageCopy r {};
+                    r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                    r.imageExtent = {info.width, info.height, 1};
+                    d.deviceTable.vkCmdCopyImageToBuffer(d.cb, info.image,
+                                                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                                         rb.buffer, 1, &r);
+
+                    // Straight back, so the next frame finds it where the chain left it.
+                    std::swap(b.oldLayout, b.newLayout);
+                    b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                    b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                    d.deviceTable.vkCmdPipelineBarrier(d.cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
+                                                       nullptr, 0, nullptr, 1, &b);
+                    d.deviceTable.vkEndCommandBuffer(d.cb);
+                    submitAndWait();
+
+                    float lo[4] = {1e30f, 1e30f, 1e30f, 1e30f};
+                    float hi[4] = {-1e30f, -1e30f, -1e30f, -1e30f};
+                    double sum[4] = {0, 0, 0, 0};
+                    size_t nan = 0, nanCh[4] = {0, 0, 0, 0}, texels = 0, texelBytes = 0;
+                    const uint8_t* px = (const uint8_t*) rb.mapped;
+                    bool known = true;
+
+                    for (size_t t = 0; t < size_t(info.width) * info.height && known; ++t) {
+                        float c[4];
+                        uint32_t stride = 0;
+                        if (!DecodeTexel(info.format, px + t * (texelBytes ? texelBytes : 16), c,
+                                         &stride)) {
+                            known = false;
+                            break;
+                        }
+                        texelBytes = stride;
+                        for (int i = 0; i < 4; ++i) {
+                            if (c[i] != c[i]) { ++nan; ++nanCh[i]; }
+                            else {
+                                lo[i] = std::min(lo[i], c[i]);
+                                hi[i] = std::max(hi[i], c[i]);
+                                sum[i] += c[i];
+                            }
+                        }
+                        ++texels;
+                    }
+
+                    if (!known) {
+                        std::printf("    %2u %-34s %4ux%-4u %-12s (not decoded here)\n", pi,
+                                    info.name, info.width, info.height, FormatName(info.format));
+                    } else {
+                        char nanNote[64] = "";
+                        if (nan)
+                            snprintf(nanNote, sizeof(nanNote),
+                                     "  *** NaN r%zu g%zu b%zu a%zu of %zu ***", nanCh[0], nanCh[1],
+                                     nanCh[2], nanCh[3], texels);
+                        char flags[64] = "";
+                        snprintf(flags, sizeof(flags), "%s%s%s%s",
+                                 info.feedback ? " fb" : "", info.levels > 1 ? " mip" : "",
+                                 info.alias && info.alias[0] ? " @" : "",
+                                 info.alias && info.alias[0] ? info.alias : "");
+                        std::printf("    %2u [img %p] %-34s %4ux%-4u %-12s rgb [%.3f..%.3f] mean %.3f%s%s\n",
+                                    pi, (void*) info.image, info.name, info.width, info.height,
+                                    FormatName(info.format), std::min({lo[0], lo[1], lo[2]}),
+                                    std::max({hi[0], hi[1], hi[2]}),
+                                    texels ? (sum[0] + sum[1] + sum[2]) / (3.0 * double(texels)) : 0.0,
+                                    nan ? nanNote : "", flags);
+                    }
+                    DropHostBuffer(&d.deviceTable, d.device, rb);
+                }
             }
 
             if (ok && !dumpDir.empty()) {
@@ -416,7 +610,7 @@ int RunRange(const std::vector<std::string>& ids, size_t from, uint32_t width, u
 
 int main(int argc, char** argv) {
     uint32_t width = 640, height = 480, stride = 1, limit = 0;
-    bool verbose = false, isolate = false;
+    bool verbose = false, isolate = false, stats = false;
     std::string dumpDir;
     std::vector<std::string> only;
 
@@ -429,6 +623,7 @@ int main(int argc, char** argv) {
         else if (arg == "--verbose") verbose = true;
         else if (arg == "--isolate") isolate = true;
         else if (arg == "--dump" && i + 1 < argc) dumpDir = argv[++i];
+        else if (arg == "--stats") stats = true;
         else only.push_back(arg);
     }
     if (!stride) stride = 1;
@@ -458,7 +653,8 @@ int main(int argc, char** argv) {
     size_t built = 0, failed = 0;
 
     if (!isolate) {
-        const int rc = RunRange(ids, 0, width, height, verbose, -1, &built, &failed, dumpDir);
+        const int rc =
+            RunRange(ids, 0, width, height, verbose, -1, &built, &failed, dumpDir, stats);
         if (rc) return rc;
         std::printf("\n%zu built and recorded, %zu failed\n", built, failed);
         return failed ? 1 : 0;
@@ -485,7 +681,7 @@ int main(int argc, char** argv) {
             size_t childBuilt = 0, childFailed = 0;
             const int rc =
                 RunRange(ids, next, width, height, verbose, fds[1], &childBuilt,
-                         &childFailed, dumpDir);
+                         &childFailed, dumpDir, stats);
             // Counts travel back through the pipe's last two words rather than a second channel.
             const size_t tally[2] = {childBuilt, childFailed};
             ssize_t ignored = write(fds[1], tally, sizeof(tally));
