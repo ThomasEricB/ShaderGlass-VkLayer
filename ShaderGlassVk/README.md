@@ -120,6 +120,33 @@ turns over. `semantics_test` covers the libretro naming rules on their own, with
 meson test -C build/native
 ```
 
+## The interface
+
+`shaderglass-gui` is a second process that shares the file mapping with the layer. It does not
+launch the game, attach to it, or know anything about it beyond what the layer writes into that
+mapping, so it can be started and stopped at any point — including while a game is running.
+
+```bash
+SHADERGLASS_PRESETS=build/catalog/cm/libShaderGlassPresets.so ./build/native/gui/shaderglass-gui
+```
+
+- **Shader** — the catalogue as a tree, with a filter box, and the selected preset's parameters as
+  sliders. What it publishes is *overrides*: a parameter you have not touched is absent, so a preset
+  with several hundred of them still fits the 128 slots the protocol reserves.
+- **Input** — the source raster the shader is shown. Pixel size, output policy, aspect, crop and
+  frame skip arrive in phase 6 with the layer code that honours them.
+- **Capture** — the matched pair the layer writes on request: the frame the game presented, and the
+  frame it presented after the chain ran. There is no preview renderer (decision 8); a second render
+  in another process would be a different frame at a different raster.
+
+Profiles save the preset, the settings and the parameter overrides together, under
+`~/.local/share/ShaderGlass/ShaderGlassVk/profiles`. They are keyed by the same names
+`shaderglass-ctl` uses, so a profile is readable and stays valid when the interface's wording does
+not.
+
+Qt 6 is optional: a build without it still produces the layer, the generator and the control tool,
+which is everything a headless or packaging build needs.
+
 ## Compiling presets
 
 `shaderglass-gen` is ShaderGen's job done for Vulkan. It compiles libretro `.slangp` presets to
@@ -207,6 +234,8 @@ DLSS5VKLayer, which had to ship every frame to a Windows helper and wait for it 
 | `SHADERGLASS_TIME=1` | Periodic frame-count lines |
 | `SHADERGLASS_SELFTEST=1` | Run the chain with no preset and compare its output against its input once, logging whether they match |
 | `SHADERGLASS_PRESETS` | Path to `libShaderGlassPresets.so`. Without it the normal loader search runs, which is what a packaged install wants |
+| `SHADERGLASS_GUI_GRAB` | Render the interface's window to this path and exit — how the layout is checked without a person looking at it |
+| `SHADERGLASS_GUI_TAB` | Which tab that grab should show |
 
 The mapping lives under `/tmp` rather than `$XDG_RUNTIME_DIR` on purpose: a Steam game runs inside
 pressure-vessel, which gives the container a private tmpfs there, so a mapping put in it is simply

@@ -35,4 +35,5 @@ subdir('layer')
 if host_cpu == 'x86_64'
   subdir('tools')
   subdir('gen')
+  subdir('gui')
 endif

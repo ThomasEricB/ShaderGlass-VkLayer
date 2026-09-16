@@ -82,6 +82,12 @@ class Chain {
     // tests/chain_test.cpp caught when Record tried to be clever about it.
     void FrameCompleted();
 
+    // Ask for one matched pair of frames -- what the game presented, and what it presented after
+    // the chain ran -- written as PPM beside the mapping. The interface shows the pair; nothing
+    // here renders a preview (decision 8), because a second render in another process would be a
+    // different frame at a different raster and would prove nothing about this one.
+    void RequestCapture();
+
     uint32_t PassCount() const { return uint32_t(_passes.size()); }
 
     // What a pass wrote, for tools that want to look inside the chain. A signal chain -- NTSC
@@ -290,6 +296,15 @@ class Chain {
     // Parameter values from the interface, by name. Kept whether or not a preset declares them, so
     // switching presets does not lose a value the user set.
     std::map<std::string, float> _parameters;
+
+    // Only allocated once a capture is actually asked for.
+    HostBuffer _capture {};
+    VkDeviceSize _captureHalf = 0;
+    bool _captureArmed = false;
+    bool _capturePending = false;
+    uint64_t _captureSerial = 0;
+
+    void WriteCapture();
 
     // Only allocated when the self-test is asked for.
     HostBuffer _selfTest {};

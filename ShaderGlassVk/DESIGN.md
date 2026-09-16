@@ -1,6 +1,6 @@
 # ShaderGlass on a Vulkan layer — design and port plan
 
-**Status:** phases 1-4 complete (tree, builds, protocol, layer, the full multi-pass executor, and the .slangp -> SPIR-V compiler with a generated catalogue). The full libretro `slang-shaders` tree compiles: 3328 of 3330 presets, the other 2 being parameter fragments rather than presets, and 49 files failing only on dangling references that are broken in upstream itself. Phase 5 next.
+**Status:** phases 1-5 complete (tree, builds, protocol, layer, the full multi-pass executor, and the .slangp -> SPIR-V compiler with a generated catalogue). The full libretro `slang-shaders` tree compiles: 3328 of 3330 presets, the other 2 being parameter fragments rather than presets, and 49 files failing only on dangling references that are broken in upstream itself. Phase 6 next.
 **Scope:** everything below is additive under `ShaderGlassVk/`. No existing upstream file is modified,
 moved or deleted, so the Windows app builds exactly as it does today.
 
@@ -140,6 +140,17 @@ semantic (`MaxNits`, `PaperWhiteNits`, `InputGamma` and seven more) are declared
 `#pragma parameter` in most shaders and merely omitted in a few, so they read zero in RetroArch too.
 Of 317 sampler names, every structural-looking one (`Pass1`, `PassPrev2`, `SourceHDR`) is a preset
 alias — `Pass1` in 891 presets — and resolves through the alias mechanism.
+
+### The interface (phase 5)
+
+| Decision | Why |
+|---|---|
+| **The interface publishes parameter *overrides*, not values** | The layer already resolves each parameter as shader default, then preset override, then whatever the interface set. So the shared block only has to carry the third — and a Mega Bezel preset with several hundred parameters still fits in the 128 slots the protocol reserves, because a parameter nobody has touched is simply absent |
+| **Parameter names are written without bumping a sequence** | The only sequence guarding them is `presetSeq`, which also guards the preset id. Bumping it while a slider is being dragged would make the layer's guarded read of the id retry and, often enough, give up — and an empty id reads as "no preset" |
+| **Profiles are keyed by the names `shaderglass-ctl` uses**, not by the visible label | A profile keyed off the interface's wording would break when the wording changed, and would be written in whatever language the interface happened to be running in |
+| **Tabs are Shader, Input and Capture** — Output and Advanced arrive in phase 6 | Decision 15 named four tabs, but the layer does not yet honour pixel size, output policy, aspect, crop or frame skip. A tab of controls that do nothing reads as a bug rather than a plan |
+| **`SHADERGLASS_GUI_GRAB` renders the window to a file and exits**, and `SHADERGLASS_GUI_TAB` picks the tab | The interface is the one part of this tree that cannot be checked by running it and reading a log. This makes "does it lay out, does the tree populate, does the parameter panel fill in" answerable the same way everything else here is |
+| **Captures are PPM** | Qt reads them natively and the layer needs no encoder — which matters for a library mapped into every game. The pair is what the chain already has in hand: the frame the game presented and the frame it presented after |
 
 ### Decisions taken without asking, and why
 
@@ -316,7 +327,7 @@ lost; what goes is capture and window management, which is exactly what the laye
 | 2 | **Done.** Pass executor with a built-in passthrough: swapchain → source raster → one pass → swapchain, verified bit-exact and validation-clean |
 | 3 | **Done.** ShaderGC ported to Linux emitting SPIR-V; `shaderglass-gen` producing the catalogue; the preset library builds and loads through `dlopen` |
 | 4 | **Done.** Full pass model — multi-pass, scale types, feedback/history, textures, per-pass formats. `tests/chain_test.cpp` builds and records every preset in the catalogue with no game and no window |
-| 5 | Qt GUI — preset tree, parameters, profiles, status, screenshot view |
+| 5 | **Done.** `shaderglass-gui` — preset tree over the catalogue, parameter panel, profiles, live status, and the before/after view, with the layer-side capture that feeds it |
 | 6 | Source resolution, pixel size and output policy, aspect ratio, crop, flip/rotate, frame skip, pause, idle repaint, the gamescope launch helper |
 | 7 | Packaging, docs, `RELICENSE.md`, PR preparation. Every package's build runs `tools/build-catalogue.sh`, which is what guarantees the shader patches reach an installed catalogue |
 

@@ -140,6 +140,28 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
   # The SPIR-V decoration edit, on modules built by hand.
   add_executable(spirv_edit_test tests/spirv_edit_test.cpp gen/spirv_edit.cpp)
   add_test(NAME spirv_edit COMMAND spirv_edit_test)
+
+  # --- the interface -----------------------------------------------------------
+  # Optional: a build with no Qt still produces the layer, the generator and the control tool,
+  # which is everything a headless or packaging build needs.
+  find_package(Qt6 COMPONENTS Core Gui Widgets QUIET)
+  if(Qt6_FOUND)
+    set(CMAKE_AUTOMOC ON)
+    add_executable(shaderglass-gui
+      gui/main.cpp
+      gui/mainwindow.cpp
+      gui/preset_tree.cpp
+      gui/param_panel.cpp
+      gui/capture_view.cpp
+      gui/shm_binder.cpp
+      # The catalogue loader is the layer's own, so the interface and the layer can never disagree
+      # about what a catalogue contains or which ABI they accept.
+      layer/src/catalogue.cpp)
+    target_include_directories(shaderglass-gui PRIVATE gui common presets layer/src)
+    target_link_libraries(shaderglass-gui PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets ${CMAKE_DL_LIBS})
+  else()
+    message(STATUS "Qt 6 not found: skipping shaderglass-gui")
+  endif()
 endif()
 
 # --- the control tool --------------------------------------------------------

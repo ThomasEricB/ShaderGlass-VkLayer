@@ -11,7 +11,10 @@ GNU General Public License v3.0
 #include "texture.h"
 #include "shaders/passthrough_spv.h"
 
+#include <sys/stat.h>
+
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 
@@ -53,6 +56,17 @@ uint32_t FormatBytes(VkFormat f) {
         case VK_FORMAT_R32G32B32A32_SFLOAT: return 16u;
         default: return 4u;
     }
+}
+
+// mkdir -p, without pulling <filesystem> into a library that is mapped into every game on the
+// system. Existing directories are success.
+bool MakeDirectories(const std::string& path) {
+    for (size_t i = 1; i <= path.size(); ++i) {
+        if (i != path.size() && path[i] != '/') continue;
+        const std::string part = path.substr(0, i);
+        if (mkdir(part.c_str(), 0700) != 0 && errno != EEXIST) return false;
+    }
+    return true;
 }
 
 bool SelfTestWanted() {
@@ -262,6 +276,9 @@ void Chain::DropAll() {
     DropHostBuffer(_vk, _device, _vertices);
     DropHostBuffer(_vk, _device, _uniforms);
     DropHostBuffer(_vk, _device, _lutStaging);
+    DropHostBuffer(_vk, _device, _capture);
+    _captureHalf = 0;
+    _capturePending = false;
     _lutUploads.clear();
 
     _swapWidth = _swapHeight = 0;
@@ -1534,6 +1551,37 @@ bool Chain::Record(VkCommandBuffer cb, VkImage swapchainImage, uint64_t frameCou
         _selfTestRecorded = true;
     }
 
+    // ---- a requested capture ----
+    if (_captureArmed) {
+        _captureArmed = false;
+        const VkDeviceSize half = VkDeviceSize(_swapWidth) * _swapHeight * 4;
+
+        // Allocated on demand and kept: a capture is a deliberate act, and whoever asks for one
+        // usually asks again.
+        if (_captureHalf != half) DropHostBuffer(_vk, _device, _capture);
+        if (!_capture.buffer &&
+            MakeHostBuffer(_vk, _instance, _device, _physical, _capture, half * 2,
+                           VK_BUFFER_USAGE_TRANSFER_DST_BIT))
+            _captureHalf = half;
+
+        if (_capture.buffer && FormatBytes(_chainFormat) == 4) {
+            Transition(_vk, cb, _frame, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            Transition(_vk, cb, last, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+            VkBufferImageCopy r {};
+            r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            r.imageExtent = {_swapWidth, _swapHeight, 1};
+            _vk->vkCmdCopyImageToBuffer(cb, _frame.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                        _capture.buffer, 1, &r);
+            r.bufferOffset = half;
+            _vk->vkCmdCopyImageToBuffer(cb, last.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                        _capture.buffer, 1, &r);
+            _capturePending = true;
+        } else {
+            Log("[capture] no room, or a format this cannot write");
+        }
+    }
+
     // ---- back into the swapchain ----
     Transition(_vk, cb, last, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     TransitionForeign(_vk, cb, swapchainImage, externalLayout,
@@ -1585,12 +1633,110 @@ Chain::PassInfo Chain::PassAt(uint32_t index) const {
     return info;
 }
 
+void Chain::RequestCapture() { _captureArmed = true; }
+
+// Both halves are the chain's own format, which is whatever the swapchain uses -- and that is not
+// always 8-bit. This display hands out A2R10G10B10_UNORM_PACK32, and a capture written as though
+// it were BGRA8 comes out as recognisable shapes in impossible colours, which is how this was
+// found. Unknown formats are refused rather than guessed at.
+bool ChainTexelToRgb(VkFormat format, const uint8_t* px, uint8_t* rgb) {
+    switch (format) {
+        case VK_FORMAT_B8G8R8A8_UNORM:
+        case VK_FORMAT_B8G8R8A8_SRGB:
+            rgb[0] = px[2]; rgb[1] = px[1]; rgb[2] = px[0];
+            return true;
+        case VK_FORMAT_R8G8B8A8_UNORM:
+        case VK_FORMAT_R8G8B8A8_SRGB:
+            rgb[0] = px[0]; rgb[1] = px[1]; rgb[2] = px[2];
+            return true;
+        case VK_FORMAT_A8B8G8R8_UNORM_PACK32:
+        case VK_FORMAT_A8B8G8R8_SRGB_PACK32: {
+            uint32_t v;
+            std::memcpy(&v, px, sizeof(v));
+            rgb[0] = uint8_t(v & 0xFF);
+            rgb[1] = uint8_t((v >> 8) & 0xFF);
+            rgb[2] = uint8_t((v >> 16) & 0xFF);
+            return true;
+        }
+        // In a PACK32 format the first-named component occupies the highest bits. Ten bits are
+        // scaled to eight by dropping the low two, which is what a screenshot wants.
+        case VK_FORMAT_A2R10G10B10_UNORM_PACK32: {
+            uint32_t v;
+            std::memcpy(&v, px, sizeof(v));
+            rgb[0] = uint8_t(((v >> 20) & 0x3FF) >> 2);
+            rgb[1] = uint8_t(((v >> 10) & 0x3FF) >> 2);
+            rgb[2] = uint8_t((v & 0x3FF) >> 2);
+            return true;
+        }
+        case VK_FORMAT_A2B10G10R10_UNORM_PACK32: {
+            uint32_t v;
+            std::memcpy(&v, px, sizeof(v));
+            rgb[0] = uint8_t((v & 0x3FF) >> 2);
+            rgb[1] = uint8_t(((v >> 10) & 0x3FF) >> 2);
+            rgb[2] = uint8_t(((v >> 20) & 0x3FF) >> 2);
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+void Chain::WriteCapture() {
+    if (!_capturePending || !_capture.mapped) return;
+    _capturePending = false;
+
+    const std::string dir = ShmCaptureDir();
+    if (!MakeDirectories(dir)) {
+        Log("[capture] could not create %s", dir.c_str());
+        return;
+    }
+
+    {
+        // Checked once, before any file is created, so a format this cannot write leaves nothing
+        // half-written behind.
+        uint8_t probe[3];
+        const uint8_t zero[4] = {0, 0, 0, 0};
+        if (!ChainTexelToRgb(_chainFormat, zero, probe)) {
+            Log("[capture] cannot write format %d", (int) _chainFormat);
+            return;
+        }
+    }
+
+    const auto* bytes = (const uint8_t*) _capture.mapped;
+    const uint64_t serial = _captureSerial++;
+
+    for (int half = 0; half < 2; ++half) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/%08llu-%s.ppm", dir.c_str(),
+                 (unsigned long long) serial, half == 0 ? "before" : "after");
+
+        FILE* f = fopen(path, "wb");
+        if (!f) {
+            Log("[capture] could not write %s", path);
+            return;
+        }
+        fprintf(f, "P6\n%u %u\n255\n", _swapWidth, _swapHeight);
+
+        const uint8_t* src = bytes + (half ? _captureHalf : 0);
+        for (size_t i = 0; i < size_t(_swapWidth) * _swapHeight; ++i) {
+            uint8_t rgb[3] = {0, 0, 0};
+            ChainTexelToRgb(_chainFormat, src + i * 4, rgb);
+            fwrite(rgb, 1, 3, f);
+        }
+        fclose(f);
+    }
+
+    Log("[capture] wrote %s/%08llu-{before,after}.ppm (%ux%u)", dir.c_str(),
+        (unsigned long long) serial, _swapWidth, _swapHeight);
+}
+
 void Chain::FrameCompleted() {
     // The upload recorded in the retired frame has happened, so the staging buffer can go. For a
     // Mega Bezel preset it is tens of megabytes of host memory, in a process that belongs to
     // someone else.
     if (_lutStaging.buffer && _lutUploads.empty()) DropHostBuffer(_vk, _device, _lutStaging);
 
+    WriteCapture();
     ConsumeSelfTest();
 }
 

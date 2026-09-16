@@ -118,6 +118,11 @@ inline std::string ShmDefaultPath() { return ShmRuntimeDir() + "/shm.bin"; }
 
 inline size_t ShmTotalBytes() { return kHeaderBytes; }
 
+// Where the layer writes captured frames and the interface looks for them. Beside the mapping, for
+// the same reason the mapping is where it is: both sides have to agree on a path that exists on
+// both sides of a container boundary.
+inline std::string ShmCaptureDir() { return ShmRuntimeDir() + "/captures"; }
+
 // One shader parameter, as the interface publishes it and the layer reads it.
 //
 // The name is written when the preset changes and is guarded by presetSeq rather than by a sequence

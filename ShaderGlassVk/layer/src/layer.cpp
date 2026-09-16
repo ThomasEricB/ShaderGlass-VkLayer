@@ -235,6 +235,11 @@ struct DeviceChain {
     // The loader's hook for installing a dispatch table on a dispatchable object a layer creates.
     PFN_vkSetDeviceLoaderData setDeviceLoaderData = nullptr;
 
+    // The last captureRequest seen. The interface only ever increments it, so any difference is a
+    // request; storing the count rather than a flag means a second request while the first is still
+    // in flight is not lost.
+    uint32_t captureSeen = 0;
+
     PFN_vkDestroyDevice vkDestroyDevice = nullptr;
     PFN_vkGetDeviceQueue vkGetDeviceQueue = nullptr;
     PFN_vkGetDeviceQueue2 vkGetDeviceQueue2 = nullptr;
@@ -950,6 +955,17 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
                 uint32_t sourceW = 0, sourceH = 0;
                 ShmSourceExtent(dc->shm.hdr, sc.width, sc.height, &sourceW, &sourceH);
                 const std::string presetId = ShmPresetId(dc->shm.hdr);
+
+                // A capture is asked for by bumping a counter, and answered by the next frame the
+                // chain composes -- which is the only frame that has both halves of the pair.
+                if (dc->shm.hdr) {
+                    const uint32_t want =
+                        dc->shm.hdr->captureRequest.load(std::memory_order_acquire);
+                    if (want != dc->captureSeen) {
+                        dc->captureSeen = want;
+                        if (sc.chain) sc.chain->RequestCapture();
+                    }
+                }
 
                 const uint32_t waitCount =
                     waitsConsumed ? 0u : pPresentInfo->waitSemaphoreCount;
