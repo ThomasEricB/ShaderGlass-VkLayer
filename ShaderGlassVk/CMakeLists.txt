@@ -57,7 +57,9 @@ add_library(${SG_LAYER_NAME} SHARED
   layer/src/texture.cpp
   layer/src/crash_trace.cpp
   layer/src/pixel_grid.cpp
-  layer/src/chain_order.cpp)
+  layer/src/chain_order.cpp
+  layer/src/placement.cpp
+  layer/src/gamescope_output.cpp)
 
 target_include_directories(${SG_LAYER_NAME} PRIVATE layer/src common presets ${SG_VULKAN_INCLUDE})
 target_link_libraries(${SG_LAYER_NAME} PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
@@ -153,6 +155,24 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
   target_include_directories(pixel_grid_test PRIVATE layer/src)
   add_test(NAME pixel_grid COMMAND pixel_grid_test)
 
+  # Output placement, checked against numbers worked out by hand.
+  add_executable(placement_test tests/placement_test.cpp layer/src/placement.cpp)
+  target_include_directories(placement_test PRIVATE layer/src)
+  add_test(NAME placement COMMAND placement_test)
+
+  # The Steam launch options the interface generates.
+  add_executable(launch_command_test tests/launch_command_test.cpp gui/launch_command.cpp)
+  add_test(NAME launch_command COMMAND launch_command_test)
+
+  # Dragging the crop rectangle on a capture.
+  add_executable(crop_geometry_test tests/crop_geometry_test.cpp gui/crop_geometry.cpp)
+  add_test(NAME crop_geometry COMMAND crop_geometry_test)
+
+  # The gamescope composite-target tracker.
+  add_executable(gamescope_output_test tests/gamescope_output_test.cpp layer/src/gamescope_output.cpp)
+  target_include_directories(gamescope_output_test PRIVATE layer/src)
+  add_test(NAME gamescope_output COMMAND gamescope_output_test)
+
   # --- the interface -----------------------------------------------------------
   # Optional: a build with no Qt still produces the layer, the generator and the control tool,
   # which is everything a headless or packaging build needs.
@@ -165,8 +185,11 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
       gui/preset_tree.cpp
       gui/param_panel.cpp
       gui/capture_view.cpp
+      gui/crop_picker.cpp
+      gui/crop_geometry.cpp
       gui/shm_binder.cpp
       gui/game_probe.cpp
+      gui/launch_command.cpp
       # The catalogue loader is the layer's own, so the interface and the layer can never disagree
       # about what a catalogue contains or which ABI they accept.
       layer/src/catalogue.cpp)
@@ -180,7 +203,7 @@ endif()
 # --- the control tool --------------------------------------------------------
 # 64-bit only: a 32-bit game needs a 32-bit layer loaded into it, but nothing else here is per-arch.
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
-  add_executable(shaderglass-ctl tools/shmctl.cpp)
+  add_executable(shaderglass-ctl tools/shmctl.cpp gui/launch_command.cpp)
   target_include_directories(shaderglass-ctl PRIVATE common)
   target_link_options(shaderglass-ctl PRIVATE "-static-libstdc++" "-static-libgcc")
 endif()

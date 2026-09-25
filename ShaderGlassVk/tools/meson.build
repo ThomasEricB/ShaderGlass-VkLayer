@@ -1,5 +1,5 @@
 executable('shaderglass-ctl',
-  'shmctl.cpp',
+  ['shmctl.cpp', '../gui/launch_command.cpp'],
   include_directories: include_directories('../common'),
   link_args: ['-static-libstdc++', '-static-libgcc'],
   install: false,
@@ -25,7 +25,7 @@ test('semantics', semantics_test)
 executable('chain_test',
   ['../tests/chain_test.cpp', '../layer/src/chain.cpp', '../layer/src/catalogue.cpp',
    '../layer/src/semantics.cpp', '../layer/src/texture.cpp',
-   '../layer/src/pixel_grid.cpp'],
+   '../layer/src/pixel_grid.cpp', '../layer/src/placement.cpp'],
   include_directories: include_directories('../layer/src', '../common', '../presets'),
   cpp_args: layer_args,
   dependencies: [vulkan_dep, cpp.find_library('dl', required: false)],
@@ -46,3 +46,35 @@ pixel_grid_test = executable('pixel_grid_test',
   install: false,
 )
 test('pixel_grid', pixel_grid_test)
+
+# Output placement, checked against numbers worked out by hand: see tests/placement_test.cpp.
+placement_test = executable('placement_test',
+  ['../tests/placement_test.cpp', '../layer/src/placement.cpp'],
+  include_directories: include_directories('..', '../layer/src'),
+  install: false,
+)
+test('placement', placement_test)
+
+# The Steam launch options the interface generates: see tests/launch_command_test.cpp.
+launch_command_test = executable('launch_command_test',
+  ['../tests/launch_command_test.cpp', '../gui/launch_command.cpp'],
+  include_directories: include_directories('..'),
+  install: false,
+)
+test('launch_command', launch_command_test)
+
+# Dragging the crop rectangle: see tests/crop_geometry_test.cpp.
+crop_geometry_test = executable('crop_geometry_test',
+  ['../tests/crop_geometry_test.cpp', '../gui/crop_geometry.cpp'],
+  include_directories: include_directories('..'),
+  install: false,
+)
+test('crop_geometry', crop_geometry_test)
+
+# The gamescope composite-target tracker: see tests/gamescope_output_test.cpp.
+gamescope_output_test = executable('gamescope_output_test',
+  ['../tests/gamescope_output_test.cpp', '../layer/src/gamescope_output.cpp'],
+  include_directories: include_directories('..', '../layer/src'),
+  install: false,
+)
+test('gamescope_output', gamescope_output_test)

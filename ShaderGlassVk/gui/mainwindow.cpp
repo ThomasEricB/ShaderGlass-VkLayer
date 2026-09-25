@@ -7,6 +7,8 @@ GNU General Public License v3.0
 #include "mainwindow.h"
 
 #include "capture_view.h"
+#include "crop_picker.h"
+#include "launch_command.h"
 #include "game_probe.h"
 #include "param_panel.h"
 #include "preset_tree.h"
@@ -14,11 +16,19 @@ GNU General Public License v3.0
 
 #include "../layer/src/catalogue.h"
 
+#include <QApplication>
 #include <QCheckBox>
+#include <QClipboard>
+#include <QDoubleSpinBox>
+#include <QGroupBox>
+#include <QLineEdit>
+#include <QScreen>
+#include <QSpinBox>
 #include <QCloseEvent>
 #include <QComboBox>
 #include <QDir>
 #include <QFile>
+#include <QFileDialog>
 #include <QFileInfo>
 #include <QFormLayout>
 #include <QHBoxLayout>
@@ -73,6 +83,8 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     auto* tabs = new QTabWidget(this);
     tabs->addTab(BuildShaderTab(), tr("Shader"));
     tabs->addTab(BuildInputTab(), tr("Input"));
+    const int outputTab = tabs->addTab(BuildOutputTab(), tr("Output"));
+    tabs->addTab(BuildAdvancedTab(), tr("Advanced"));
 
     _capture = new CaptureView(this);
     const int captureTab = tabs->addTab(_capture, tr("Capture"));
@@ -80,9 +92,13 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
 
     // Look for a new pair when the tab is opened, and while it is open -- a capture lands a frame
     // or two after the button is pressed, and the interface has no way to be told when.
-    connect(tabs, &QTabWidget::currentChanged, this, [this, captureTab](int index) {
+    // The crop picker on the Output tab shows the newest capture too, and is refreshed the same way.
+    connect(tabs, &QTabWidget::currentChanged, this, [this, captureTab, outputTab](int index) {
         _captureVisible = (index == captureTab);
+        _outputVisible = (index == outputTab);
         if (_captureVisible) _capture->Refresh(QString::fromStdString(ShmCaptureDir()));
+        if (_outputVisible && _cropPicker)
+            _cropPicker->Refresh(QString::fromStdString(ShmCaptureDir()));
     });
 
     // --- the row every tab shares -------------------------------------------------------------
@@ -306,15 +322,265 @@ QWidget* MainWindow::BuildInputTab() {
     _autoSourceLabel->setEnabled(false);
     form->addRow(QString(), _autoSourceLabel);
 
-    auto* note = new QLabel(
-        tr("Pixel size, output policy, aspect, crop and frame skip arrive with the layer code that "
-           "honours them."),
-        page);
-    note->setWordWrap(true);
-    note->setEnabled(false);
-    form->addRow(note);
+    return page;
+}
+
+// A preset list beside a numeric control. Picking one sets the number, which the binder then writes,
+// so the preset is a shortcut into the same setting rather than a second copy of it -- and a value
+// typed by hand is never contradicted by a preset label claiming otherwise. The list resets to its
+// prompt afterwards for the same reason.
+static void AddPresets(QFormLayout* form, QWidget* parent, QDoubleSpinBox* target,
+                       const QList<QPair<QString, double>>& items) {
+    auto* combo = new QComboBox(parent);
+    combo->addItem(QObject::tr("Presets\u2026"));
+    for (const auto& it : items) combo->addItem(it.first, it.second);
+    QObject::connect(combo, QOverload<int>::of(&QComboBox::activated), combo,
+                     [combo, target](int i) {
+                         if (i <= 0) return;
+                         target->setValue(combo->itemData(i).toDouble());
+                         combo->setCurrentIndex(0);
+                     });
+    form->addRow(QString(), combo);
+}
+
+QWidget* MainWindow::BuildOutputTab() {
+    auto* page = new QWidget(this);
+    auto* form = new QFormLayout(page);
+
+    // The presets are the Windows app's, value for value (ShaderGlass/Options.h), so a setting
+    // carried over from it means the same thing here.
+    auto* size = _binder->AddFloat(
+        form, "pixelsize", tr("Pixel size"), &ShmHeader::pixelSizeBits, 0.0, 16.0, 0.05,
+        tr("How many screen pixels one source pixel occupies.\n"
+           "Auto fills the window and the setting stays out of the way. A size makes the picture "
+           "that size, and the output policy below decides what happens to the rest of the window "
+           "-- which is what lets a CRT preset draw scanlines at a chosen thickness rather than "
+           "whatever the window happens to give it."));
+    size->setSpecialValueText(tr("Auto"));
+    size->setPrefix(QStringLiteral("\u00d7"));
+    AddPresets(form, page, size,
+               {{tr("Auto"), 0.0},
+                {QStringLiteral("\u00d71"), 1.0},
+                {QStringLiteral("\u00d72"), 2.0},
+                {tr("\u00d72.25 (480p \u2192 1080p)"), 2.25},
+                {QStringLiteral("\u00d73"), 3.0},
+                {QStringLiteral("\u00d74"), 4.0},
+                {tr("\u00d74.5 (240p \u2192 1080p)"), 4.5},
+                {QStringLiteral("\u00d75"), 5.0},
+                {tr("\u00d75.4 (200p \u2192 1080p)"), 5.4},
+                {tr("\u00d76 (240p \u2192 1440p)"), 6.0},
+                {QStringLiteral("\u00d77"), 7.0},
+                {tr("\u00d77.2 (200p \u2192 1440p)"), 7.2},
+                {QStringLiteral("\u00d78"), 8.0},
+                {tr("\u00d79 (240p \u2192 4K)"), 9.0},
+                {QStringLiteral("\u00d710"), 10.0},
+                {tr("\u00d710.8 (200p \u2192 4K)"), 10.8}});
+
+    _binder->AddChoice(form, "outputpolicy", tr("Output policy"), &ShmHeader::outputPolicy,
+                       {tr("Auto"), tr("Stretch to fill"), tr("Fit"), tr("Fill"),
+                        tr("Integer + letterbox"), tr("Centre 1:1")},
+                       tr("What happens when the picture and the window are not the same size.\n"
+                          "Integer keeps the shader's pixel grid exact, at the cost of black "
+                          "bars. Fit keeps the shape and letterboxes. Fill keeps the shape and "
+                          "crops. Stretch fills the window and bends the shape. Centre 1:1 "
+                          "shows the picture at its own size, magnified by the pixel size and "
+                          "nothing else."));
+
+    auto* aspect = _binder->AddFloat(
+        form, "aspect", tr("Aspect correction"), &ShmHeader::aspectRatioBits, 0.25, 4.0, 0.01,
+        tr("How tall a source pixel is for its width.\n"
+           "Many older systems did not have square pixels: a DOS game's 320x200 was shown on a 4:3 "
+           "screen, so each pixel was 1.2 times as tall as it was wide. The picture is corrected "
+           "and letterboxed inside the game's window. 1.00 is none."));
+    AddPresets(form, page, aspect,
+               {{tr("None"), 1.0},
+                {tr("\u00d71.2 (DOS, NTSC)"), 1.2},
+                {tr("\u00d70.94 (PAL)"), 0.9375},
+                {tr("\u00d70.8 (NES)"), 0.8},
+                {tr("\u00d70.86 (SNES)"), 0.857143},
+                {tr("\u00d70.5 (double wide)"), 0.5},
+                {tr("\u00d72.0 (double tall)"), 2.0}});
+
+    _binder->AddChoice(form, "rotation", tr("Rotation"), &ShmHeader::rotation,
+                       {tr("None"), tr("90\u00b0 clockwise"), tr("180\u00b0"),
+                        tr("90\u00b0 anticlockwise")},
+                       tr("Turn the picture. For vertical arcade games on a horizontal screen, "
+                          "and the other way round."));
+    _binder->AddBool(form, "fliph", tr("Mirror horizontally"), &ShmHeader::flipHorizontal,
+                     tr("Flip left and right."));
+    _binder->AddBool(form, "flipv", tr("Mirror vertically"), &ShmHeader::flipVertical,
+                     tr("Flip top and bottom."));
+
+    auto* cropBox = new QGroupBox(tr("Confine the effect to a rectangle"), page);
+    cropBox->setToolTip(FormatTip(
+        tr("Only this part of the game's window is shaded; the rest is shown exactly as the "
+           "game drew it. In the game's own pixels, so these numbers and a capture agree.")));
+    // The numbers on the left, the picture they describe on the right.
+    auto* cropRow = new QHBoxLayout(cropBox);
+    auto* cropForm = new QFormLayout;
+    cropRow->addLayout(cropForm);
+    QCheckBox* cropOn =
+        _binder->AddBool(cropForm, "cropenabled", tr("Enabled"), &ShmHeader::cropEnabled,
+                         tr("Shade only the rectangle below."));
+    QSpinBox* cropX = _binder->AddInt(cropForm, "cropx", tr("Left"), &ShmHeader::cropX, 0, 16384,
+                                      tr("Distance from the left edge of the game's window."));
+    QSpinBox* cropY = _binder->AddInt(cropForm, "cropy", tr("Top"), &ShmHeader::cropY, 0, 16384,
+                                      tr("Distance from the top edge of the game's window."));
+    QSpinBox* cropW =
+        _binder->AddInt(cropForm, "cropwidth", tr("Width"), &ShmHeader::cropWidth, 0, 16384,
+                        tr("Width of the shaded rectangle."));
+    QSpinBox* cropH =
+        _binder->AddInt(cropForm, "cropheight", tr("Height"), &ShmHeader::cropHeight, 0, 16384,
+                        tr("Height of the shaded rectangle."));
+
+    // The same four numbers, dragged on the newest capture (decision 12).
+    _cropPicker = new CropPicker(cropOn, cropX, cropY, cropW, cropH, cropBox);
+    cropRow->addWidget(_cropPicker, 1);
+    form->addRow(cropBox);
 
     return page;
+}
+
+QWidget* MainWindow::BuildAdvancedTab() {
+    auto* page = new QWidget(this);
+    auto* form = new QFormLayout(page);
+
+    // 0 and 1 both mean every frame in the protocol, so the control starts at 1 and calls it that; a
+    // header holding 0 reads back as the same thing.
+    auto* skip = _binder->AddInt(
+        form, "frameskip", tr("Run the shader"), &ShmHeader::frameSkip, 1, 20,
+        tr("Run the shader chain on one frame in N and show that result again on the frames in "
+           "between. Saves the GPU work of a heavy preset, at the cost of the effect updating less "
+           "often than the game does."));
+    skip->setSpecialValueText(tr("Every frame"));
+    skip->setPrefix(tr("1 in "));
+
+    auto* every = _binder->AddInt(
+        form, "autosourcems", tr("Re-measure every"), &ShmHeader::autoSourceIntervalMs, 0, 60000,
+        tr("How often Detect automatically looks at the game's raster again. Shorter follows a "
+           "game that changes resolution sooner; the measurement is cheap either way."));
+    every->setSingleStep(250);
+    every->setSuffix(tr(" ms"));
+    every->setSpecialValueText(tr("Default (2 s)"));
+
+    // --- gamescope ------------------------------------------------------------------------------
+    auto* gs = new QGroupBox(tr("Launch options for gamescope"), page);
+    auto* gsForm = new QFormLayout(gs);
+
+    _launchWhere = new QComboBox(gs);
+    _launchWhere->addItem(tr("In the game \u2014 gamescope scales the shaded result"));
+    _launchWhere->addItem(tr("On gamescope's output \u2014 works for OpenGL games too"));
+    _launchWhere->setToolTip(FormatTip(
+        tr("Two ways to run under gamescope, and they draw different pictures.\n"
+           "In the game: the game renders small, the shader runs at that size, and gamescope "
+           "scales the result up -- cheapest, but a one-pixel scanline is magnified into a thick "
+           "bar with everything else.\n"
+           "On gamescope's output: the shader runs on what gamescope shows, at full screen "
+           "resolution -- which also shades games the layer cannot otherwise see, OpenGL ones "
+           "included.")));
+    gsForm->addRow(tr("Shade"), _launchWhere);
+
+    _gamescopeBinary = new QLineEdit(gs);
+    _gamescopeBinary->setPlaceholderText(tr("gamescope, from PATH"));
+    _gamescopeBinary->setClearButtonEnabled(true);
+    _gamescopeBinary->setToolTip(FormatTip(
+        tr("A custom gamescope build to use instead of the one on PATH, by its full path -- one "
+           "built from source with its own patches, say. Leave empty for the installed one.")));
+    auto* browse = new QPushButton(tr("Browse\u2026"), gs);
+    auto* binRow = new QHBoxLayout;
+    binRow->addWidget(_gamescopeBinary, 1);
+    binRow->addWidget(browse);
+    gsForm->addRow(tr("gamescope"), binRow);
+    connect(browse, &QPushButton::clicked, this, [this] {
+        const QString start = _gamescopeBinary->text().isEmpty()
+                                  ? QDir::homePath()
+                                  : QFileInfo(_gamescopeBinary->text()).absolutePath();
+        const QString path =
+            QFileDialog::getOpenFileName(this, tr("Choose a gamescope binary"), start);
+        if (!path.isEmpty()) _gamescopeBinary->setText(path);
+    });
+    connect(_gamescopeBinary, &QLineEdit::textChanged, this,
+            [this](const QString&) { UpdateLaunchCommand(); });
+
+    _launchNearest = new QCheckBox(tr("Hard pixels when scaling (nearest)"), gs);
+    _launchNearest->setChecked(true);
+    gsForm->addRow(QString(), _launchNearest);
+
+    _launchLine = new QLineEdit(gs);
+    _launchLine->setReadOnly(true);
+    auto* copy = new QPushButton(tr("Copy"), gs);
+    auto* row = new QHBoxLayout;
+    row->addWidget(_launchLine, 1);
+    row->addWidget(copy);
+    gsForm->addRow(tr("Paste into Steam"), row);
+
+    _launchNote = new QLabel(gs);
+    _launchNote->setWordWrap(true);
+    _launchNote->setEnabled(false);
+    gsForm->addRow(QString(), _launchNote);
+    form->addRow(gs);
+
+    connect(copy, &QPushButton::clicked, this, [this] {
+        QApplication::clipboard()->setText(_launchLine->text());
+        _status->setText(tr("Launch options copied."));
+    });
+    connect(_launchWhere, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+            [this](int) { UpdateLaunchCommand(); });
+    connect(_launchNearest, &QCheckBox::toggled, this, [this](bool) { UpdateLaunchCommand(); });
+    UpdateLaunchCommand();
+
+    return page;
+}
+
+// Regenerated from the settings as they stand, including the source raster a running game resolved
+// -- which is what gamescope should have the game render at -- so the line tracks the other tabs.
+void MainWindow::UpdateLaunchCommand() {
+    if (!_launchLine) return;
+
+    LaunchInput in;
+    in.where = _launchWhere && _launchWhere->currentIndex() == 1 ? LaunchWhere::kGamescope
+                                                                  : LaunchWhere::kGame;
+    const QString custom = _gamescopeBinary ? _gamescopeBinary->text().trimmed() : QString();
+    if (custom.isEmpty()) {
+        in.gamescopeInstalled =
+            !QStandardPaths::findExecutable(QStringLiteral("gamescope")).isEmpty();
+    } else {
+        // A path, whole: a relative one would be resolved against wherever Steam starts the game.
+        const QFileInfo fi(QDir::cleanPath(custom.startsWith(QLatin1Char('~'))
+                                               ? QDir::homePath() + custom.mid(1)
+                                               : custom));
+        in.gamescopeBinary = fi.absoluteFilePath().toStdString();
+        in.gamescopeInstalled = fi.isFile() && fi.isExecutable();
+    }
+    in.insideGamescope = qEnvironmentVariableIsSet("GAMESCOPE_WAYLAND_DISPLAY");
+    in.nearest = _launchNearest && _launchNearest->isChecked();
+
+    // The screen gamescope should fill, in device pixels -- a scaled desktop reports logical ones.
+    if (const QScreen* screen = QGuiApplication::primaryScreen()) {
+        const QSize px = screen->size() * screen->devicePixelRatio();
+        in.displayW = uint32_t(px.width());
+        in.displayH = uint32_t(px.height());
+    }
+
+    if (_hdr) {
+        in.policy = _hdr->outputPolicy.load(std::memory_order_relaxed);
+        // What these settings resolve against the whole screen, which is what gamescope hands the
+        // game. Not the raster a running game reported: with a crop that describes part of the
+        // window, and telling the game to render at the size of a crop would shrink all of it.
+        // The detector contributes its measured scale here, so this is right in every mode.
+        uint32_t rw = 0, rh = 0;
+        ShmSourceExtent(_hdr, in.displayW, in.displayH, &rw, &rh);
+        // A source that is the screen itself is not a reason to make the game render smaller.
+        if (rw != in.displayW || rh != in.displayH) {
+            in.renderW = rw;
+            in.renderH = rh;
+        }
+    }
+
+    const LaunchCommand c = BuildLaunchCommand(in);
+    const QString line = QString::fromStdString(c.line);
+    if (_launchLine->text() != line) _launchLine->setText(line);
+    _launchNote->setText(QString::fromStdString(c.note));
 }
 
 // Ask the layer to throw away what it measured and measure again. A counter rather than a flag: a
@@ -406,6 +672,7 @@ void MainWindow::UpdateStatus() {
 
     _status->setText(text);
     UpdateNotice(stale, game);
+    UpdateLaunchCommand();
 
     if (_autoSourceLabel) {
         if (!_hdr->autoSourceEnabled.load(std::memory_order_relaxed)) {
@@ -438,6 +705,7 @@ void MainWindow::UpdateStatus() {
     }
 
     if (_captureVisible && _capture) _capture->Refresh(QString::fromStdString(ShmCaptureDir()));
+    if (_outputVisible && _cropPicker) _cropPicker->Refresh(QString::fromStdString(ShmCaptureDir()));
 }
 
 // A game that stops presenting looks exactly like a game that exited, from the mapping alone. It is
@@ -562,6 +830,8 @@ void MainWindow::LoadConfig() {
         if (_presets) _presets->Select(preset);
         ChoosePreset(preset);
     }
+    if (_gamescopeBinary)
+        _gamescopeBinary->setText(settings.value(QStringLiteral("gamescopeBinary")).toString());
     const QSize size = settings.value(QStringLiteral("size")).toSize();
     if (size.isValid()) resize(size);
 
@@ -577,4 +847,6 @@ void MainWindow::SaveConfig() {
     settings.setValue(QStringLiteral("preset"), _currentPreset);
     settings.setValue(QStringLiteral("size"), size());
     settings.setValue(QStringLiteral("profile"), _profiles->currentText());
+    if (_gamescopeBinary)
+        settings.setValue(QStringLiteral("gamescopeBinary"), _gamescopeBinary->text().trimmed());
 }

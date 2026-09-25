@@ -200,7 +200,9 @@ struct ShmHeader {
     std::atomic<uint32_t> pixelSizeBits;
     std::atomic<uint32_t> outputPolicy;  // OutputPolicy
 
-    // Pixel-aspect correction, applied by letterboxing inside the game's own window. 1.0 is none.
+    // Pixel-aspect correction, applied by letterboxing inside the game's own window: the height of a
+    // source pixel relative to its width, as the Windows app counts it -- 1.2 for DOS and NTSC, 2.0
+    // for double tall, 0.5 for double wide. 1.0 is none.
     std::atomic<uint32_t> aspectRatioBits;
 
     std::atomic<uint32_t> flipHorizontal;
@@ -427,6 +429,9 @@ inline std::string ShmPresetId(const ShmHeader* h) {
 
 // The raster the chain should be shown, resolved from the settings and the swapchain size. Kept here
 // rather than in the layer so the interface can show the same number the layer will use.
+// swapW and swapH are the area the source is taken from: the whole swapchain, or the crop rectangle
+// when there is one. A divisor divides that area, not the screen, so halving a crop gives half the
+// crop.
 inline void ShmSourceExtent(const ShmHeader* h, uint32_t swapW, uint32_t swapH,
                             uint32_t* outW, uint32_t* outH) {
     uint32_t w = swapW, hgt = swapH;
@@ -436,8 +441,18 @@ inline void ShmSourceExtent(const ShmHeader* h, uint32_t swapW, uint32_t swapH,
         const uint32_t aw = h->autoSourceWidth.load();
         const uint32_t ah = h->autoSourceHeight.load();
         if (aw && ah) {
-            *outW = aw < kMinW ? kMinW : (aw > kMaxW ? kMaxW : aw);
-            *outH = ah < kMinH ? kMinH : (ah > kMaxH ? kMaxH : ah);
+            // The measured scale applied to this area, rather than the measured raster itself. The
+            // raster was worked out against the whole frame; a crop is a part of it and deserves its
+            // proportional share. For the whole frame the two give the same number.
+            const float sx = BitsToFloat(h->autoSourceScaleXBits.load());
+            const float sy = BitsToFloat(h->autoSourceScaleYBits.load());
+            uint32_t rw = aw, rh = ah;
+            if (sx >= 1.0f && sy >= 1.0f) {
+                rw = uint32_t(float(swapW) / sx + 0.5f);
+                rh = uint32_t(float(swapH) / sy + 0.5f);
+            }
+            *outW = rw < kMinW ? kMinW : (rw > kMaxW ? kMaxW : rw);
+            *outH = rh < kMinH ? kMinH : (rh > kMaxH ? kMaxH : rh);
             return;
         }
         // On, but nothing measured yet: fall through to the mode until there is an answer.

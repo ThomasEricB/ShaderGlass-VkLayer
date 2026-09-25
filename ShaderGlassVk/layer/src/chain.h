@@ -32,6 +32,7 @@ Every failure is fail-open: a chain that cannot be built leaves the game's own f
 #include "../../common/shm_protocol.h"
 #include "../../presets/preset_api.h"
 #include "pixel_grid.h"
+#include "placement.h"
 #include "semantics.h"
 #include "texture.h"
 #include "vk_util.h"
@@ -67,6 +68,22 @@ class Chain {
     bool Prepare(uint32_t swapWidth, uint32_t swapHeight, VkFormat swapFormat, uint32_t sourceWidth,
                  uint32_t sourceHeight, const std::string& presetId);
 
+    // The same, with the output settings: where in the swapchain the effect reads and writes, what
+    // the last pass renders at, and whether it is turned. Only the target's size, the view and the
+    // turn rebuild anything; where the picture lands, the bars and the mirrors are applied at record
+    // time, so moving a crop or flipping the image costs nothing. See placement.h.
+    //
+    // The overload above is this one with the identity placement -- the whole swapchain, one to
+    // one -- which is what every caller before phase 6 meant, and what the self-test depends on.
+    bool Prepare(uint32_t swapWidth, uint32_t swapHeight, VkFormat swapFormat, uint32_t sourceWidth,
+                 uint32_t sourceHeight, const Placement& placement, const std::string& presetId);
+
+    // Place the last composed picture into the swapchain again, without running a pass. What frame
+    // skip draws on the frames it skips, and what a paused chain draws every frame. Returns false
+    // when there is nothing composed yet to show.
+    bool RecordReplay(VkCommandBuffer cb, VkImage swapchainImage,
+                      VkImageLayout externalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+
     // Parameter values from the interface, matched to the preset's declarations by name. Cheap and
     // does not rebuild anything -- a parameter tweak only changes the bytes written to a uniform
     // block, which is why the protocol separates tuningSeq from controlSeq.
@@ -76,8 +93,28 @@ class Chain {
     // every path out, including the ones that give up, so a caller that stops here still presents
     // something valid. The layer always passes PRESENT_SRC_KHR; the parameter exists because
     // tests/chain_test.cpp drives the chain over an ordinary image, with no swapchain in sight.
+    //
+    // keepInput runs the passes again on the frame the chain already holds rather than taking the
+    // swapchain's new one -- a paused chain, where the picture stays still but a parameter can still
+    // be adjusted against it. Ignored until the chain holds a frame, since until then there is
+    // nothing to hold.
     bool Record(VkCommandBuffer cb, VkImage swapchainImage, uint64_t frameCount,
-                VkImageLayout externalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+                VkImageLayout externalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                bool keepInput = false);
+
+    // Whether there is a composed picture to replay.
+    bool HasComposed() const { return _composed; }
+
+    // Whether there is a game frame to compose from without reading the swapchain -- which after a
+    // rebuild there still is, when the new chain's frame is the same size and format as the old: a
+    // preset changed while the game is not presenting is composed from the frame it last presented.
+    bool HoldsInput() const { return _inputHeld; }
+
+    // Write the result back through this storage view instead of copying it. For a target the chain
+    // may not copy into: gamescope's output images carry Storage but not TransferDst, and the view
+    // is the one gamescope itself binds to write them, so this write is exactly as valid as its own.
+    // VK_NULL_HANDLE goes back to copying, which is what every swapchain uses.
+    void SetStorageTarget(VkImageView view) { _storageView = view; }
 
     // Call once the previous Record's submit has retired -- the layer does it after waiting on that
     // frame's fence. Resources a command buffer was still referencing can only be released here,
@@ -119,8 +156,10 @@ class Chain {
         const char* alias = "";
     };
     PassInfo PassAt(uint32_t index) const;
-    uint32_t OutputWidth() const { return _swapWidth; }
-    uint32_t OutputHeight() const { return _swapHeight; }
+    // The view: what the preset's last pass renders at, before it is placed. It was the swapchain
+    // until phase 6, which is why the protocol calls it the output raster.
+    uint32_t OutputWidth() const { return _viewWidth; }
+    uint32_t OutputHeight() const { return _viewHeight; }
     uint32_t SourceWidth() const { return _sourceWidth; }
     uint32_t SourceHeight() const { return _sourceHeight; }
     const std::string& PresetId() const { return _presetId; }
@@ -169,6 +208,10 @@ class Chain {
         bool floatFb = false;
         bool mipmapInput = false;  // this pass wants a mip chain on what it reads
         uint32_t frameCountMod = 0;
+
+        // The chain's own quarter-turn pass, appended after the preset's when the output is turned.
+        // A passthrough with a rotated MVP -- a blit can mirror an image but cannot turn it.
+        bool turn = false;
         std::string alias;
 
         // Derived when the chain is built.
@@ -247,6 +290,53 @@ class Chain {
 
     uint32_t _swapWidth = 0, _swapHeight = 0;
     uint32_t _sourceWidth = 0, _sourceHeight = 0;
+
+    // Phase 6 geometry. The target is where in the swapchain the effect reads and writes; the view
+    // is what the preset's last pass renders at, which libretro calls the viewport and which is no
+    // longer the swapchain. The placement's per-frame half lives in _placement.
+    uint32_t _targetWidth = 0, _targetHeight = 0;
+    uint32_t _viewWidth = 0, _viewHeight = 0;
+    bool _quarterTurn = false;
+    size_t _userPassCount = 0;  // the preset's own passes; the turn pass, if any, comes after
+    Placement _placement {};
+    bool _composed = false;  // there is a result in the last pass that a replay could show
+    bool _inputHeld = false;  // _frame holds a frame the game presented
+
+    // _frame, taken out of the old chain's way across a rebuild and put back if the new one wants the
+    // same image. Dropped with the sized surfaces if nobody claims it.
+    Image _keptFrame {};
+
+    // Black, one pixel, blitted to fill the bars around a letterboxed picture. vkCmdClearColorImage
+    // clears a whole image or nothing, and a bar is a rectangle inside the swapchain.
+    Image _black {};
+
+    // Where the picture is composed before it goes to the swapchain, in the chain's own format.
+    //
+    // Not blitted into the swapchain directly, because a blit converts: an _SRGB swapchain behind a
+    // chain that works in the _UNORM twin would have every value sRGB-encoded on the way in, and the
+    // picture would come out visibly too bright. The chain uses the UNORM twin precisely so that the
+    // numbers the game wrote are the numbers it works on, and the one step that reaches the
+    // swapchain has to be a raw copy to keep that true. Only the target rectangle is copied, so
+    // everything outside a crop is never written at all.
+    Image _placed {};
+
+    bool IsIdentityPlacement() const;
+    void RecordOutput(VkCommandBuffer cb, VkImage swapchainImage, VkImageLayout externalLayout);
+    void RecordPlacement(VkCommandBuffer cb, VkImage swapchainImage, VkImageLayout externalLayout);
+    void ComposePlaced(VkCommandBuffer cb);
+
+    // The storage write-back: built the first time a storage target is used, and kept, since it does
+    // not depend on the swapchain's size.
+    VkImageView _storageView = VK_NULL_HANDLE;
+    VkDescriptorSetLayout _wbSetLayout = VK_NULL_HANDLE;
+    VkPipelineLayout _wbLayout = VK_NULL_HANDLE;
+    VkPipeline _wbPipeline = VK_NULL_HANDLE;
+    VkDescriptorPool _wbPool = VK_NULL_HANDLE;
+    VkDescriptorSet _wbSet = VK_NULL_HANDLE;
+    VkSampler _wbSampler = VK_NULL_HANDLE;
+    bool BuildWriteback();
+    void DropWriteback();
+    void RecordWriteback(VkCommandBuffer cb, VkImage target, VkImageLayout externalLayout);
     VkFormat _swapFormat = VK_FORMAT_UNDEFINED;
     VkFormat _chainFormat = VK_FORMAT_UNDEFINED;
 

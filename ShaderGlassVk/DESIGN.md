@@ -1,6 +1,6 @@
 # ShaderGlass on a Vulkan layer — design and port plan
 
-**Status:** phases 1-5 complete (tree, builds, protocol, layer, the full multi-pass executor, and the .slangp -> SPIR-V compiler with a generated catalogue). The full libretro `slang-shaders` tree compiles: 3328 of 3330 presets, the other 2 being parameter fragments rather than presets, and 49 files failing only on dangling references that are broken in upstream itself. Phase 6 next.
+**Status:** phases 1-6 complete (tree, builds, protocol, layer, the full multi-pass executor, the .slangp -> SPIR-V compiler with a generated catalogue, the interface, and the output controls). The full libretro `slang-shaders` tree compiles: 3328 of 3330 presets, the other 2 being parameter fragments rather than presets, and 49 files failing only on dangling references that are broken in upstream itself. Phase 7 (packaging and the PR) next.
 **Scope:** everything below is additive under `ShaderGlassVk/`. No existing upstream file is modified,
 moved or deleted, so the Windows app builds exactly as it does today.
 
@@ -328,7 +328,7 @@ lost; what goes is capture and window management, which is exactly what the laye
 | 3 | **Done.** ShaderGC ported to Linux emitting SPIR-V; `shaderglass-gen` producing the catalogue; the preset library builds and loads through `dlopen` |
 | 4 | **Done.** Full pass model — multi-pass, scale types, feedback/history, textures, per-pass formats. `tests/chain_test.cpp` builds and records every preset in the catalogue with no game and no window |
 | 5 | **Done.** `shaderglass-gui` — preset tree over the catalogue, parameter panel, profiles, live status, and the before/after view, with the layer-side capture that feeds it |
-| 6 | Source resolution, pixel size and output policy, aspect ratio, crop, flip/rotate, frame skip, pause, idle repaint, the gamescope launch helper |
+| 6 | **Done.** Source resolution (with automatic detection), pixel size and output policy, aspect ratio, crop (numeric and dragged on a capture), flip/rotate, frame skip, pause, idle repaint, the gamescope launch helper (custom builds included), and shading gamescope's own output on every backend |
 | 7 | Packaging, docs, `RELICENSE.md`, PR preparation. Every package's build runs `tools/build-catalogue.sh`, which is what guarantees the shader patches reach an installed catalogue |
 
 ---
@@ -462,6 +462,28 @@ is not subtle:
   resolution downsamples to 320×240, and the chain targets the full swapchain. Scanlines are drawn at
   display resolution and stay one pixel thin. More expensive, and usually what a CRT preset's author
   intended.
+
+**A third: the layer in gamescope itself.** `SHADERGLASS=1 gamescope --force-composition … -- env
+SHADERGLASS_DISABLE=1 %command%` shades gamescope's composited output instead of the game's frames,
+which reaches anything gamescope can show — an OpenGL game included. It works on every backend, by two
+different routes:
+
+- **SDL** presents through a Vulkan swapchain, and the present hook shades it like any game.
+- **Wayland, DRM, OpenVR and headless** never present through Vulkan. The layer follows gamescope's
+  composite instead (`layer/src/gamescope_output.h`): it recognises the output images and the
+  screenshot/PipeWire textures by their exact usage at `vkCreateImage`, follows the storage view
+  through the descriptor set to the command buffer, and records the chain into gamescope's own command
+  buffer right behind the dispatch that wrote the target. Recording in place rather than submitting
+  alongside matters twice over: gamescope releases the image to the backend at the end of that command
+  buffer, and a PipeWire frame is converted to NV12 inside it — anything appended after either would
+  touch an image gamescope has already handed on. On headless, the PipeWire stream and screenshots are
+  the only pixels there are, and they are what is shaded.
+
+Two things gamescope does have to be steered around. It composites on a compute-only queue where the
+GPU has one, and the chain draws — so the layer sets gamescope's own `GAMESCOPE_FORCE_GENERAL_QUEUE`
+before gamescope picks a queue, and refuses to record for a compute-only one if that was overridden.
+And a fullscreen game with nothing on top is scanned out directly, never composited, so there is
+nothing to shade: hence `--force-composition` (or `gamescopectl composite_force 1` on a running one).
 
 **Delivery.** The GUI cannot launch the game — Steam or the user does — so this is a launch-command
 helper, not a runtime feature: detect gamescope with `command -v`, detect whether we are *already*

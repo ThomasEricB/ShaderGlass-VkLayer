@@ -5,6 +5,8 @@ layer_sources = files(
   'src/semantics.cpp',
   'src/pixel_grid.cpp',
   'src/chain_order.cpp',
+  'src/placement.cpp',
+  'src/gamescope_output.cpp',
   'src/texture.cpp',
   'src/crash_trace.cpp',
 )

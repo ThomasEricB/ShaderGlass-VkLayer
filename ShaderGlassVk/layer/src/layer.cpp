@@ -27,16 +27,23 @@ process that does not ask for it.
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_layer.h>
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
 #include "../../common/shm_protocol.h"
 #include "chain_order.h"
+#include "gamescope_output.h"
 #include "chain.h"
 #include "crash_trace.h"
 #include "log.h"
@@ -228,6 +235,12 @@ struct SwapchainState {
     // -- a fade to black, a full-screen menu or a title card all measure differently from the game.
     double lastProbeMs = 0.0;
     uint32_t probeCandidateW = 0, probeCandidateH = 0;
+    // Frame skip counts presents, and composes one in every N. A pause freezes FrameCount as well as
+    // the picture, or a shader that animates over time would keep moving on a still image.
+    uint64_t skipCounter = 0;
+    bool wasPaused = false;
+    uint64_t heldFrameCount = 0;
+
     bool autoSourceWasOn = false;
     uint32_t autoSourceRefreshSeen = 0;
     bool autoSourceRefreshSeeded = false;
@@ -267,6 +280,7 @@ struct DeviceChain {
     PFN_vkDestroySwapchainKHR vkDestroySwapchainKHR = nullptr;
     PFN_vkGetSwapchainImagesKHR vkGetSwapchainImagesKHR = nullptr;
     PFN_vkAcquireNextImageKHR vkAcquireNextImageKHR = nullptr;
+    PFN_vkAcquireNextImage2KHR vkAcquireNextImage2KHR = nullptr;
     PFN_vkQueuePresentKHR vkQueuePresentKHR = nullptr;
     PFN_vkQueueSubmit vkQueueSubmit = nullptr;
     PFN_vkQueueSubmit2 vkQueueSubmit2 = nullptr;
@@ -295,6 +309,47 @@ struct DeviceChain {
     // that silence into one line per transition.
     std::atomic<const char*> lastSkip {nullptr};
     std::atomic<uint64_t> presentCalls {0};
+
+    // The idle repaint (see RepaintLoop). A game that stops presenting -- paused, in a debugger, a
+    // menu that stops drawing -- would otherwise show a settings change only once it presents again.
+    //
+    // It uses the game's queue and swapchain from a thread of its own, and Vulkan leaves both to the
+    // application to synchronise. Locks cannot do it: the game's acquire and present hooks were once
+    // locked and deadlocked against each other, and would again against a thread that acquires. So
+    // a handshake instead: appCalls counts the game's calls in flight, repainting says a repaint is,
+    // and each side raises its own before looking at the other's -- sequentially consistent, so at
+    // least one of them sees the other. The repaint backs off; the game waits, briefly, for one that
+    // is already under way, whose every step is bounded.
+    std::atomic<int> appCalls {0};
+    std::atomic<bool> repainting {false};
+    std::atomic<double> lastPresentMs {0.0};
+    // controlSeq as of the last frame composed, by the game's present or by a repaint. A different
+    // value while the game is silent is a setting it has not yet seen.
+    std::atomic<uint32_t> composedSeq {0};
+    std::atomic<bool> composedAny {false};
+    std::thread repaintThread;
+    std::mutex repaintWakeLock;
+    std::condition_variable repaintWake;
+    bool repaintStop = false;
+    VkFence repaintFence = VK_NULL_HANDLE;
+    bool repaintBroken = false;  // a repaint's acquire never completed; its fence is still in use
+
+    // Which queue families can run graphics work. The chain draws, so it can only be recorded for one
+    // of these -- gamescope's compute-only queue is not.
+    std::vector<bool> graphicsFamily;
+
+    // Only used inside gamescope, on backends that never present: which of its images are output
+    // images, which command buffer composites into which, and the state that shades them. See
+    // gamescope_output.h.
+    OutputTracker gamescope;
+    // gamescope's composite targets, one chain each -- its output images, and the screenshot and
+    // PipeWire textures, which are sized and formatted by whoever asked for them. Keyed by what a
+    // chain is built for, so a stream and the display do not rebuild each other every frame.
+    std::map<std::tuple<uint32_t, uint32_t, VkFormat, int>, SwapchainState> gamescopeTargets;
+
+    // Command buffers of gamescope's that the chain was recorded into and that have not been
+    // submitted yet, and whose chain they carry: their submission takes that chain's fence.
+    std::unordered_map<VkCommandBuffer, SwapchainState*> gamescopeCarriers;
 };
 
 std::unordered_map<VkInstance, InstanceChain> g_instances;
@@ -445,6 +500,19 @@ bool LayerEnabled() {
     return dc->setDeviceLoaderData(dc->self, object) == VK_SUCCESS;
 }
 
+// The device a command buffer belongs to. A dispatchable handle's first word is the loader's dispatch
+// table, shared by a device and everything allocated from it, so it names the device without this
+// layer having seen the command buffer allocated.
+DeviceChain* DeviceForDispatch(const void* handle) {
+    if (!handle) return nullptr;
+    const void* key = *static_cast<const void* const*>(handle);
+    std::lock_guard<std::mutex> lk(g_stateMutex);
+    if (g_devices.size() == 1) return g_devices.begin()->second;
+    for (auto& kv : g_devices)
+        if (*reinterpret_cast<const void* const*>(kv.first) == key) return kv.second;
+    return nullptr;
+}
+
 DeviceChain* FindDevice(VkDevice device) {
     std::lock_guard<std::mutex> lk(g_stateMutex);
     auto it = g_devices.find(device);
@@ -460,6 +528,20 @@ DeviceChain* DeviceForQueue(VkQueue queue) {
     }
     return nullptr;
 }
+
+// Held across each of the game's calls that touch a queue or a swapchain, for the idle repaint's
+// handshake (DeviceChain::appCalls). Waiting here happens only when a repaint is already under way,
+// and lasts until it finishes -- a few milliseconds, bounded by its timeouts.
+struct AppCall {
+    explicit AppCall(DeviceChain* d) : dc(d) {
+        dc->appCalls.fetch_add(1);
+        while (dc->repainting.load()) std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+    ~AppCall() { dc->appCalls.fetch_sub(1); }
+    AppCall(const AppCall&) = delete;
+    AppCall& operator=(const AppCall&) = delete;
+    DeviceChain* dc;
+};
 
 void RememberQueue(DeviceChain* dc, VkQueue queue, uint32_t family) {
     if (!queue) return;
@@ -551,9 +633,47 @@ bool CreateSwapchainResources(DeviceChain* dc, SwapchainState& sc, uint32_t fami
 // presenting with it a second time is a wait that never completes.
 //
 // Every path out leaves the swapchain image in PRESENT_SRC_KHR, including the ones that give up.
-bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue, VkImage image,
-                    uint32_t waitCount, const VkSemaphore* waits, uint32_t sourceW,
-                    uint32_t sourceH, const std::string& presetId) {
+// How a present is composed.
+enum class Compose {
+    kFresh,   // the game's new frame, through every pass
+    kReplay,  // the last result placed again, no pass run -- the frames frame skip skips
+    kHold,    // the passes run again on the frame the chain already holds -- a paused chain, whose
+              // picture stays still while a parameter can still be adjusted against it
+};
+
+// Every output setting, read once, as the placement it adds up to, with the source raster resolved
+// against the target area -- which is the crop when there is one, so a divisor divides the crop.
+Placement ResolvePlacement(ShmHeader* h, const SwapchainState& sc, uint32_t* sourceW,
+                           uint32_t* sourceH) {
+    PlacementInput in;
+    in.swapW = sc.width;
+    in.swapH = sc.height;
+    in.cropEnabled = h->cropEnabled.load() != 0;
+    in.crop = {int32_t(h->cropX.load()), int32_t(h->cropY.load()), h->cropWidth.load(),
+               h->cropHeight.load()};
+
+    const IRect t = TargetArea(in.swapW, in.swapH, in.cropEnabled, in.crop);
+    ShmSourceExtent(h, t.w, t.h, sourceW, sourceH);
+    in.sourceW = *sourceW;
+    in.sourceH = *sourceH;
+
+    in.pixelSize = BitsToFloat(h->pixelSizeBits.load());
+    in.policy = h->outputPolicy.load();
+    in.pixelHeight = BitsToFloat(h->aspectRatioBits.load());
+    in.flipH = h->flipHorizontal.load() != 0;
+    in.flipV = h->flipVertical.load() != 0;
+    in.rotation = h->rotation.load();
+    return ComputePlacement(in);
+}
+
+// Wait out the previous frame, prepare the chain, and record it -- everything but the submit. Into
+// sc.cb, normally; into `into` for gamescope's composite, which the chain is recorded straight into,
+// right behind the dispatch that wrote the target. `layout` is the one the target arrives in and must
+// be left in.
+bool RecordFrame(DeviceChain* dc, SwapchainState& sc, VkImage image, uint32_t sourceW,
+                 uint32_t sourceH, const Placement& placement, Compose mode, uint64_t frameCount,
+                 const std::string& presetId, VkImageLayout layout,
+                 VkCommandBuffer into = VK_NULL_HANDLE, bool repaint = false) {
     // The previous frame's chain, if it is still running, must finish before anything here touches
     // the surfaces it reads or the command buffer it was recorded into.
     if (sc.fencePending) {
@@ -581,8 +701,13 @@ bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue, VkImage 
         sc.chain->FrameCompleted();
     }
 
-    if (!sc.chain->Prepare(sc.width, sc.height, sc.format, sourceW, sourceH, presetId))
+    if (!sc.chain->Prepare(sc.width, sc.height, sc.format, sourceW, sourceH, placement, presetId))
         return false;
+
+    // A repaint has no new frame, only the one the chain holds. Without it, a hold would read the
+    // swapchain image instead -- which holds a picture already shaded, and shading it again stacks
+    // the effect on itself.
+    if (repaint && !sc.chain->HoldsInput()) return false;
 
     // Parameter values are read every frame rather than watched, because they are cheap to read and
     // the alternative is a second sequence number to get wrong. Prepare has already folded in the
@@ -593,17 +718,50 @@ bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue, VkImage 
         sc.chain->ApplyParameters(dc->shm.hdr->params, count);
     }
 
-    VkCommandBufferBeginInfo bi {};
-    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (!NoteVk(dc, dc->table.vkBeginCommandBuffer(sc.cb, &bi), "vkBeginCommandBuffer")) return false;
+    const VkCommandBuffer cb = into ? into : sc.cb;
+    if (into) {
+        // gamescope records its barriers lazily, ahead of the next dispatch that needs one, so the
+        // composite's writes have none behind them yet. This one is the chain's.
+        VkImageMemoryBarrier b {};
+        b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        b.oldLayout = layout;
+        b.newLayout = layout;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = image;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        dc->table.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr,
+                                       1, &b);
+    } else {
+        VkCommandBufferBeginInfo bi {};
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        if (!NoteVk(dc, dc->table.vkBeginCommandBuffer(cb, &bi), "vkBeginCommandBuffer"))
+            return false;
+    }
 
-    if (!sc.chain->Record(sc.cb, image, dc->framesSeen)) {
-        dc->table.vkEndCommandBuffer(sc.cb);
+    // A replay needs something composed to show; until then it is an ordinary frame. Hold falls back
+    // the same way inside Record, so a pause that begins before the first frame still draws one.
+    bool recorded = false;
+    if (mode == Compose::kReplay && sc.chain->HasComposed())
+        recorded = sc.chain->RecordReplay(cb, image, layout);
+    else
+        recorded = sc.chain->Record(cb, image, frameCount, layout, mode == Compose::kHold);
+
+    if (into) return recorded;
+    if (!recorded) {
+        dc->table.vkEndCommandBuffer(cb);
         return false;
     }
-    if (!NoteVk(dc, dc->table.vkEndCommandBuffer(sc.cb), "vkEndCommandBuffer")) return false;
+    return NoteVk(dc, dc->table.vkEndCommandBuffer(cb), "vkEndCommandBuffer");
+}
 
+// Submit what RecordFrame recorded, waiting on the caller's semaphores and signalling sc.fence.
+bool SubmitFrame(DeviceChain* dc, SwapchainState& sc, VkQueue queue, uint32_t waitCount,
+                 const VkSemaphore* waits) {
     std::vector<VkPipelineStageFlags> stages(waitCount, VK_PIPELINE_STAGE_TRANSFER_BIT);
     VkSubmitInfo si {};
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -705,6 +863,17 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateInstance(const VkInstanceCreateInfo* p
     auto create = (PFN_vkCreateInstance) next_gipa(VK_NULL_HANDLE, "vkCreateInstance");
     if (!create) return VK_ERROR_INITIALIZATION_FAILED;
 
+    // gamescope composites on a compute-only queue when the GPU has one, and the chain draws with
+    // graphics pipelines, which cannot run there: appended to such a batch they hang it, and gamescope
+    // waits for that frame forever. GAMESCOPE_FORCE_GENERAL_QUEUE is gamescope's own switch to
+    // composite on the graphics+compute queue instead, read when it picks a queue -- which is after
+    // this, since picking a queue needs an instance. Only when the layer is switched on here, and
+    // never over a value somebody set.
+    if (InGamescope() && LayerEnabled() && !getenv("GAMESCOPE_FORCE_GENERAL_QUEUE")) {
+        setenv("GAMESCOPE_FORCE_GENERAL_QUEUE", "1", 0);
+        Log("[gamescope] asked gamescope to composite on its general queue, where the chain can run");
+    }
+
     // Documented pattern: keep the link node in pNext (layers below need it) and advance
     // u.pLayerInfo so the next layer resolves its own chain entry.
     link->u.pLayerInfo = link->u.pLayerInfo->pNext;
@@ -770,6 +939,9 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_EnumeratePhysicalDevices(VkInstance instance
 // ---------------------------------------------------------------------------
 // Device hooks
 // ---------------------------------------------------------------------------
+void StartRepaint(DeviceChain* dc);
+void StopRepaint(DeviceChain* dc);
+
 VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(VkPhysicalDevice physicalDevice,
                                                  const VkDeviceCreateInfo* pCreateInfo,
                                                  const VkAllocationCallbacks* pAllocator,
@@ -843,6 +1015,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(VkPhysicalDevice physicalDevice
     SG_LOAD(vkDestroySwapchainKHR)
     SG_LOAD(vkGetSwapchainImagesKHR)
     SG_LOAD(vkAcquireNextImageKHR)
+    SG_LOAD(vkAcquireNextImage2KHR)
     SG_LOAD(vkQueuePresentKHR)
     SG_LOAD(vkQueueSubmit)
     SG_LOAD(vkQueueSubmit2)
@@ -853,7 +1026,20 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(VkPhysicalDevice physicalDevice
     dc->table.next_dpa = next_dpa;
     dc->table.Load(*pDevice);
 
-    if (!dc->vkQueuePresentKHR || !dc->vkCreateSwapchainKHR || !ic) dc->inert = true;
+    if (ic && ic->table.vkGetPhysicalDeviceQueueFamilyProperties) {
+        uint32_t n = 0;
+        ic->table.vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &n, nullptr);
+        std::vector<VkQueueFamilyProperties> props(n);
+        ic->table.vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &n, props.data());
+        dc->graphicsFamily.resize(n);
+        for (uint32_t i = 0; i < n; ++i)
+            dc->graphicsFamily[i] = (props[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0;
+    }
+
+    // No swapchain means nothing to shade -- except in gamescope, whose Wayland, DRM and headless
+    // backends never create one, and whose composite is shaded instead.
+    const bool noPresent = !dc->vkQueuePresentKHR || !dc->vkCreateSwapchainKHR;
+    if (!ic || (noPresent && !InGamescope())) dc->inert = true;
 
     // No vendor check. DLSS5VKLayer went inert on non-NVIDIA devices because NGX is NVIDIA-only;
     // shader chains are not, so this runs on AMD, Intel and NVIDIA alike.
@@ -870,8 +1056,11 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(VkPhysicalDevice physicalDevice
     std::string nextOwner;
     if (LayerEnabled()) dc->dlss = FindDlssPosition((void*) dc->vkQueuePresentKHR, &nextOwner);
 
-    std::lock_guard<std::mutex> lk(g_stateMutex);
-    g_devices[*pDevice] = dc;
+    {
+        std::lock_guard<std::mutex> lk(g_stateMutex);
+        g_devices[*pDevice] = dc;
+    }
+    StartRepaint(dc);
     // Nothing from here on is anyone's business unless the layer is switched on in this process.
     if (!LayerEnabled()) return VK_SUCCESS;
     Log("[layer] device %p on %s (inert=%d enabled=%d)", (void*) *pDevice, deviceName,
@@ -902,7 +1091,9 @@ VKAPI_ATTR void VKAPI_CALL Hook_DestroyDevice(VkDevice device,
     }
     if (!dc) return;
 
+    StopRepaint(dc);
     if (dc->vkDeviceWaitIdle) dc->vkDeviceWaitIdle(device);
+    if (dc->repaintFence) dc->table.vkDestroyFence(device, dc->repaintFence, nullptr);
     {
         std::lock_guard<std::mutex> lk(dc->lock);
         for (auto& kv : dc->swapchains) {
@@ -910,6 +1101,9 @@ VKAPI_ATTR void VKAPI_CALL Hook_DestroyDevice(VkDevice device,
             DestroySwapchainResources(dc, kv.second);
         }
         dc->swapchains.clear();
+        for (auto& kv : dc->gamescopeTargets) DestroySwapchainResources(dc, kv.second);
+        dc->gamescopeTargets.clear();
+        dc->gamescopeCarriers.clear();
     }
 
     // Say the layer has gone. A reader checks the pid is alive, so a crash is caught too -- but an
@@ -962,12 +1156,18 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateSwapchainKHR(VkDevice device,
         !dc->inert && LayerEnabled() && SupportedFormat(pCreateInfo->imageFormat);
     if (wantUsage) m.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 
-    VkResult res = dc->vkCreateSwapchainKHR(device, &m, pAllocator, pSwapchain);
-    if (res != VK_SUCCESS && wantUsage) {
-        // Nothing we add is worth failing a swapchain creation over.
-        Log("[layer] swapchain refused the added transfer usage (%d); retrying with the game's own",
-            (int) res);
-        res = dc->vkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+    VkResult res;
+    {
+        // Creating one retires the old swapchain, which the idle repaint may be presenting to.
+        AppCall call(dc);
+        res = dc->vkCreateSwapchainKHR(device, &m, pAllocator, pSwapchain);
+        if (res != VK_SUCCESS && wantUsage) {
+            // Nothing we add is worth failing a swapchain creation over.
+            Log("[layer] swapchain refused the added transfer usage (%d); retrying with the "
+                "game's own",
+                (int) res);
+            res = dc->vkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+        }
     }
     if (res != VK_SUCCESS || dc->inert || !LayerEnabled()) return res;
 
@@ -1002,6 +1202,9 @@ VKAPI_ATTR void VKAPI_CALL Hook_DestroySwapchainKHR(VkDevice device, VkSwapchain
                                                     const VkAllocationCallbacks* pAllocator) {
     DeviceChain* dc = FindDevice(device);
     if (!dc) return;
+    // The whole of it: it waits for the device, which is a use of every queue, and destroys a
+    // swapchain the idle repaint may be presenting to.
+    AppCall call(dc);
 
     ReleasePrimary(device, swapchain);
     {
@@ -1044,8 +1247,19 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_AcquireNextImageKHR(VkDevice device, VkSwapc
     // game opening its menu.
     //
     // Nothing here touches layer state, so there is nothing for a lock to protect. The same is true
-    // of the queue hooks below.
+    // of the queue hooks below. What is counted is only that the call is in flight, for the idle
+    // repaint, which acquires from the same swapchain.
+    AppCall call(dc);
     return dc->vkAcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, pImageIndex);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL Hook_AcquireNextImage2KHR(VkDevice device,
+                                                         const VkAcquireNextImageInfoKHR* info,
+                                                         uint32_t* pImageIndex) {
+    DeviceChain* dc = FindDevice(device);
+    if (!dc || !dc->vkAcquireNextImage2KHR) return VK_ERROR_INITIALIZATION_FAILED;
+    AppCall call(dc);
+    return dc->vkAcquireNextImage2KHR(device, info, pImageIndex);
 }
 
 // ---------------------------------------------------------------------------
@@ -1088,6 +1302,338 @@ void NoteComposited(DeviceChain* dc) {
     if (was) Log("[present] compositing again (was: %s)", was);
 }
 
+// One frame of shading for one target, whichever way the target reached the layer: a swapchain image
+// being presented, or gamescope's composite on a backend that never presents it. Everything that
+// belongs to "a frame" is here -- the capture request, the source measurement, pause and frame skip,
+// the notices, the status -- so the two routes cannot drift apart into two slightly different
+// layers.
+//
+// `submit` is the one difference that matters. A presented image is shaded by a submission of the
+// layer's own, which waits on the caller's semaphores. gamescope's composite is not: the chain is
+// recorded into gamescope's command buffer (`into`), which gamescope submits itself.
+struct FrameResult {
+    bool composed = false;
+    uint32_t state = kLayerIdle;
+};
+
+FrameResult ShadeFrame(DeviceChain* dc, SwapchainState& sc, VkQueue queue, VkImage image,
+                       uint32_t family, bool wantChain, bool paused, bool submit,
+                       uint32_t waitCount, const VkSemaphore* waits, VkImageView storageView,
+                       VkImageLayout layout, const void* tag, bool* waitsUsed,
+                       VkCommandBuffer into = VK_NULL_HANDLE) {
+    sc.queue = queue;
+    ++dc->framesSeen;
+
+    bool composed = false;
+    if (wantChain && !sc.resourcesFailed) {
+        if (!sc.resourcesReady && !CreateSwapchainResources(dc, sc, family)) {
+            Log("[layer] could not stage the chain for %p; passing it through", tag);
+            DestroySwapchainResources(dc, sc);
+            sc.resourcesFailed = true;
+        }
+
+        if (sc.resourcesReady) {
+            uint32_t sourceW = 0, sourceH = 0;
+            const Placement placement = ResolvePlacement(dc->shm.hdr, sc, &sourceW, &sourceH);
+            const std::string presetId = ShmPresetId(dc->shm.hdr);
+
+            // Which of the three ways to compose this present.
+            Compose mode = Compose::kFresh;
+            uint64_t frameCount = dc->framesSeen;
+            if (paused) {
+                if (!sc.wasPaused) sc.heldFrameCount = dc->framesSeen;
+                mode = Compose::kHold;
+                frameCount = sc.heldFrameCount;
+            } else {
+                const uint32_t skip = dc->shm.hdr->frameSkip.load();
+                // 0 and 1 both mean every frame.
+                if (skip > 1 && (sc.skipCounter++ % skip) != 0) mode = Compose::kReplay;
+            }
+            sc.wasPaused = paused;
+
+            // A capture is asked for by bumping a counter, and answered by the next frame the
+            // chain composes -- which is the only frame that has both halves of the pair.
+            if (dc->shm.hdr) {
+                const uint32_t want =
+                    dc->shm.hdr->captureRequest.load(std::memory_order_acquire);
+                if (!dc->captureSeeded) {
+                    // Whatever is in there was asked for before this game existed.
+                    dc->captureSeeded = true;
+                    dc->captureSeen = want;
+                } else if (want != dc->captureSeen) {
+                    dc->captureSeen = want;
+                    if (sc.chain) sc.chain->RequestCapture();
+                }
+            }
+
+            // A measurement is asked for on a timer and collected whenever it is ready, which
+            // is the frame after. Neither costs anything on the frames in between.
+            if (dc->shm.hdr) {
+                ShmHeader* hdr = dc->shm.hdr;
+                const bool on = hdr->autoSourceEnabled.load() != 0;
+
+                // Two ways to be told to start again: the interface bumping the refresh
+                // counter, and the toggle changing under a layer that was running to see it.
+                // The counter is the reliable one -- a toggle flipped while no game was
+                // attached leaves no edge for anyone to notice -- and the edge is kept because
+                // shaderglass-ctl writes the toggle without bumping anything.
+                const uint32_t refresh = hdr->autoSourceRefresh.load();
+                if (!sc.autoSourceRefreshSeeded) {
+                    sc.autoSourceRefreshSeeded = true;
+                    sc.autoSourceRefreshSeen = refresh;
+                }
+                const bool asked = refresh != sc.autoSourceRefreshSeen;
+                if (asked || on != sc.autoSourceWasOn) {
+                    sc.autoSourceRefreshSeen = refresh;
+                    sc.autoSourceWasOn = on;
+                    sc.probeCandidateW = sc.probeCandidateH = 0;
+                    sc.lastProbeMs = 0.0;  // measure on the next frame, not in two seconds
+                    ForgetMeasuredSource(hdr);
+                }
+
+                if (on && sc.chain) {
+                    uint32_t every = hdr->autoSourceIntervalMs.load();
+                    if (!every) every = kAutoSourceDefaultMs;
+                    const double now = NowMs();
+                    if (now - sc.lastProbeMs >= double(every)) {
+                        sc.lastProbeMs = now;
+                        sc.chain->RequestGridProbe();
+                    }
+
+                    GridEstimate g {};
+                    if (sc.chain->TakeGridEstimate(&g)) {
+                        uint32_t aw = 0, ah = 0;
+                        if (GridToSourceExtent(g, sc.width, sc.height, &aw, &ah)) {
+                            const uint32_t curW = hdr->autoSourceWidth.load();
+                            const uint32_t curH = hdr->autoSourceHeight.load();
+                            // Applied on the strength of one measurement. An earlier version
+                            // waited for two in a row to agree, which was standing in for the
+                            // filtering the span guard and the raster floor now do properly --
+                            // and all it bought was a scene change taking two intervals to be
+                            // noticed, which is the opposite of what this is for.
+                            const bool changed = !Near(aw, curW) || !Near(ah, curH);
+
+                            if (changed) {
+                                hdr->autoSourceScaleXBits.store(FloatToBits(g.scaleX));
+                                hdr->autoSourceScaleYBits.store(FloatToBits(g.scaleY));
+                                hdr->autoSourceConfidenceBits.store(FloatToBits(g.confidence));
+                                hdr->autoSourceWidth.store(aw);
+                                hdr->autoSourceHeight.store(ah);
+                                hdr->autoSourceSeq.fetch_add(1);
+                                Log("[source] measured %ux%u (x%.2f, y%.2f, confidence %.2f)",
+                                    aw, ah, double(g.scaleX), double(g.scaleY),
+                                    double(g.confidence));
+                            }
+                            sc.probeCandidateW = aw;
+                            sc.probeCandidateH = ah;
+                        } else {
+                            // Nothing measurable on this frame, and that is not news about the
+                            // game. A dark room, a movie, a fade, a menu over black -- none of
+                            // them mean the raster changed, because the raster is a property of
+                            // the game and not of the scene. The last answer stands.
+                            //
+                            // An earlier version dropped it after a run of such frames, on the
+                            // theory that a stale answer was worse than none. In a game it is
+                            // the other way round: walking into an unlit cave made the source
+                            // raster change underfoot, which is both visible and wrong. The way
+                            // out of a bad answer is the refresh request -- the toggle, or the
+                            // button -- which did not exist when that rule was written.
+                            sc.probeCandidateW = sc.probeCandidateH = 0;
+                        }
+                    }
+                }
+            }
+
+            // The storage route when the target cannot be copied into; the copy route otherwise.
+            sc.chain->SetStorageTarget(storageView);
+            composed = RecordFrame(dc, sc, image, sourceW, sourceH, placement, mode, frameCount,
+                                   presetId, layout, into) &&
+                       (!submit || SubmitFrame(dc, sc, queue, waitCount, waits));
+
+            // Set whether or not the chain succeeded: the submit waits on them before anything
+            // can fail, so they are consumed either way.
+            if (waitCount && waitsUsed) *waitsUsed = true;
+
+            // Published every frame, so it appears as soon as there is something to say and
+            // disappears once there is not.
+            if (sc.chain && sc.chain->Usable()) {
+                const char* notice = sc.chain->Notice();
+                if (dc->lastNotice != notice) {
+                    dc->lastNotice = notice;
+                    ShmStoreString(dc->shm.hdr->layerReasonSeq, dc->shm.hdr->layerReason,
+                                   kReasonBytes, notice);
+                }
+            }
+
+            if (!composed && sc.chain && !sc.chain->Usable()) {
+                // The chain declared itself unusable on this device. Stop trying rather than
+                // failing once a frame forever.
+                ShmStoreString(dc->shm.hdr->layerReasonSeq, dc->shm.hdr->layerReason,
+                               kReasonBytes, sc.chain->Reason());
+                DestroySwapchainResources(dc, sc);
+                sc.resourcesFailed = true;
+            }
+        }
+    } else if (!wantChain && sc.resourcesReady) {
+        // Switched off. Release the chain's memory rather than holding a frame's worth of
+        // surfaces for a game that is no longer being shaded.
+        DestroySwapchainResources(dc, sc);
+    }
+
+    FrameResult r;
+    r.composed = composed;
+    r.state = sc.resourcesFailed ? kLayerFailed : composed ? kLayerActive : kLayerIdle;
+    PublishStatus(dc, sc, r.state);
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+// Idle repaint (decision 14)
+// ---------------------------------------------------------------------------
+// A game that stops presenting -- paused, sitting in a menu that no longer draws, stopped in a
+// debugger -- gives a settings change no frame to land on. This composes the frame the chain holds
+// again, into an image of the game's own swapchain, and presents it.
+//
+// It never reads the screen: the image it acquires holds a picture already shaded, and composing
+// from that stacks each edit on the last. It composes from what the chain kept (Chain::HoldsInput),
+// which survives a preset change, and does nothing when there is none.
+
+// Long enough that a game between two frames is not taken for one that has stopped, short enough to
+// answer a slider while the hand is still on it.
+constexpr double kRepaintSilenceMs = 250.0;
+constexpr auto kRepaintTick = std::chrono::milliseconds(50);
+// With the game stopped, no present is coming to hand an image back; do not wait for one.
+constexpr uint64_t kRepaintAcquireNs = 150ull * 1000 * 1000;
+
+bool RepaintEnabled() {
+    static const bool on = [] {
+        const char* v = getenv("SHADERGLASS_REPAINT");
+        return !(v && v[0] == '0');
+    }();
+    return on;
+}
+
+// One repaint, if one is due. Returns whether it presented.
+bool RepaintOnce(DeviceChain* dc) {
+    if (dc->inert || dc->repaintBroken || !dc->composedAny.load()) return false;
+    if (NowMs() - dc->lastPresentMs.load() < kRepaintSilenceMs) return false;
+
+    // The handshake: raise ours, then look at theirs.
+    dc->repainting.store(true);
+    struct Lower {
+        DeviceChain* dc;
+        ~Lower() { dc->repainting.store(false); }
+    } lower {dc};
+    if (dc->appCalls.load() != 0) return false;
+
+    // Tried, never waited for: whoever holds it may be about to wait on this thread's flag.
+    std::unique_lock<std::mutex> lk(dc->lock, std::try_to_lock);
+    if (!lk.owns_lock()) return false;
+
+    // The mapping is the present hook's to open, under this lock.
+    ShmHeader* hdr = dc->shm.hdr;
+    if (!hdr) return false;
+    const uint32_t seq = hdr->controlSeq.load();
+    if (seq == dc->composedSeq.load()) return false;
+
+    // Settled before an image is taken: an acquired image goes back only by being presented.
+    VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+    {
+        std::lock_guard<std::mutex> pl(g_primaryMutex);
+        if (g_primary.device == dc->self) swapchain = g_primary.swapchain;
+    }
+    auto it = dc->swapchains.find(swapchain);
+    if (it == dc->swapchains.end()) return false;
+    SwapchainState& sc = it->second;
+    if (sc.passThrough || sc.resourcesFailed || !sc.resourcesReady || !sc.chain || !sc.queue ||
+        !sc.chain->HoldsInput())
+        return false;
+    if (!ShmEnabled(hdr) || ShmPresetId(hdr).empty()) {
+        // Switched off, or the preset cleared, while the game is stopped. Nothing to compose; the
+        // game's next frame goes through untouched.
+        dc->composedSeq.store(seq);
+        return false;
+    }
+
+    if (!dc->repaintFence) {
+        VkFenceCreateInfo fi {};
+        fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        if (dc->table.vkCreateFence(dc->self, &fi, nullptr, &dc->repaintFence) != VK_SUCCESS)
+            return false;
+    }
+
+    uint32_t index = 0;
+    const VkResult acquired = dc->vkAcquireNextImageKHR(dc->self, swapchain, kRepaintAcquireNs,
+                                                        VK_NULL_HANDLE, dc->repaintFence, &index);
+    if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR) return false;  // try next tick
+    const VkResult ready =
+        dc->table.vkWaitForFences(dc->self, 1, &dc->repaintFence, VK_TRUE, kRepaintAcquireNs);
+    if (ready == VK_SUCCESS) {
+        dc->table.vkResetFences(dc->self, 1, &dc->repaintFence);
+    } else {
+        // The image is ours but the fence is still in use. Leak the fence rather than destroy what
+        // is pending, stop repainting, and hand the image back untouched below.
+        Log("[repaint] an acquired image never became ready; idle repaint stopped");
+        dc->repaintFence = VK_NULL_HANDLE;
+        dc->repaintBroken = true;
+    }
+
+    bool composed = false;
+    if (ready == VK_SUCCESS && index < sc.images.size()) {
+        uint32_t sourceW = 0, sourceH = 0;
+        const Placement placement = ResolvePlacement(hdr, sc, &sourceW, &sourceH);
+        const uint64_t frameCount = sc.wasPaused ? sc.heldFrameCount : dc->framesSeen;
+        sc.chain->SetStorageTarget(VK_NULL_HANDLE);
+        composed = RecordFrame(dc, sc, sc.images[index], sourceW, sourceH, placement,
+                               Compose::kHold, frameCount, ShmPresetId(hdr),
+                               VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_NULL_HANDLE,
+                               /*repaint=*/true) &&
+                   SubmitFrame(dc, sc, sc.queue, 0, nullptr);
+    }
+
+    // Presented either way -- untouched, it is the picture that was on screen a frame or two ago.
+    VkPresentInfoKHR pi {};
+    pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    pi.swapchainCount = 1;
+    pi.pSwapchains = &swapchain;
+    pi.pImageIndices = &index;
+    const VkResult presented = dc->vkQueuePresentKHR(sc.queue, &pi);
+
+    // Composed or not, this setting has had its answer; a failure would only fail again.
+    dc->composedSeq.store(seq);
+    if (Verbose())
+        Log("[repaint] image %u %s, present %d", index, composed ? "recomposed" : "untouched",
+            (int) presented);
+    return composed;
+}
+
+void RepaintLoop(DeviceChain* dc) {
+    std::unique_lock<std::mutex> lk(dc->repaintWakeLock);
+    while (!dc->repaintStop) {
+        dc->repaintWake.wait_for(lk, kRepaintTick, [dc] { return dc->repaintStop; });
+        if (dc->repaintStop) break;
+        lk.unlock();
+        RepaintOnce(dc);
+        lk.lock();
+    }
+}
+
+void StartRepaint(DeviceChain* dc) {
+    if (dc->inert || !LayerEnabled() || !RepaintEnabled()) return;
+    dc->repaintThread = std::thread(RepaintLoop, dc);
+}
+
+// Before anything the thread touches is destroyed, and outside every lock it takes.
+void StopRepaint(DeviceChain* dc) {
+    if (!dc->repaintThread.joinable()) return;
+    {
+        std::lock_guard<std::mutex> lk(dc->repaintWakeLock);
+        dc->repaintStop = true;
+    }
+    dc->repaintWake.notify_all();
+    dc->repaintThread.join();
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
                                                     const VkPresentInfoKHR* pPresentInfo) {
     DeviceChain* dc = DeviceForQueue(queue);
@@ -1102,6 +1648,10 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
         });
         return VK_ERROR_INITIALIZATION_FAILED;
     }
+
+    // For the idle repaint: this call is in flight, and the game is presenting.
+    AppCall inFlight(dc);
+    dc->lastPresentMs.store(NowMs());
 
     // Counted before any early-out, so the log can tell a hook that stopped being called from one
     // that is still called and declining to do anything.
@@ -1133,6 +1683,8 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
     static std::once_flag namePublished;
     std::call_once(namePublished, [dc] { PublishGameName(dc); });
 
+    // Read before any setting is, so a change made while this frame composes is still news after it.
+    const uint32_t seq = dc->shm.hdr->controlSeq.load();
     const bool enabled = ShmEnabled(dc->shm.hdr);
     const bool paused = dc->shm.hdr->paused.load() != 0;
     const std::string preset = ShmPresetId(dc->shm.hdr);
@@ -1150,7 +1702,10 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
         const char* p = getenv("SHADERGLASS_SELFTEST");
         return p && p[0] == '1';
     }();
-    const bool wantChain = enabled && !paused && (!preset.empty() || selfTest);
+    // Paused is not off. It used to be: a pause switched the chain off and let the game's raw frames
+    // through, when every description of it -- shaderglass-ctl's help, the interface's tooltip -- says
+    // it freezes the chain on the last composed frame. It now does, and see Compose::kHold.
+    const bool wantChain = enabled && (!preset.empty() || selfTest);
 
     uint32_t family = 0;
     if (auto qit = dc->queueFamilies.find(queue); qit != dc->queueFamilies.end())
@@ -1187,156 +1742,14 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
         }
         handledAny = true;
 
-        sc.queue = queue;
-        ++dc->framesSeen;
-
-        bool composed = false;
-        if (wantChain && !sc.resourcesFailed) {
-            if (!sc.resourcesReady && !CreateSwapchainResources(dc, sc, family)) {
-                Log("[layer] could not stage the chain for swapchain %p; passing it through",
-                    (void*) pPresentInfo->pSwapchains[i]);
-                DestroySwapchainResources(dc, sc);
-                sc.resourcesFailed = true;
-            }
-
-            if (sc.resourcesReady) {
-                uint32_t sourceW = 0, sourceH = 0;
-                ShmSourceExtent(dc->shm.hdr, sc.width, sc.height, &sourceW, &sourceH);
-                const std::string presetId = ShmPresetId(dc->shm.hdr);
-
-                // A capture is asked for by bumping a counter, and answered by the next frame the
-                // chain composes -- which is the only frame that has both halves of the pair.
-                if (dc->shm.hdr) {
-                    const uint32_t want =
-                        dc->shm.hdr->captureRequest.load(std::memory_order_acquire);
-                    if (!dc->captureSeeded) {
-                        // Whatever is in there was asked for before this game existed.
-                        dc->captureSeeded = true;
-                        dc->captureSeen = want;
-                    } else if (want != dc->captureSeen) {
-                        dc->captureSeen = want;
-                        if (sc.chain) sc.chain->RequestCapture();
-                    }
-                }
-
-                // A measurement is asked for on a timer and collected whenever it is ready, which
-                // is the frame after. Neither costs anything on the frames in between.
-                if (dc->shm.hdr) {
-                    ShmHeader* hdr = dc->shm.hdr;
-                    const bool on = hdr->autoSourceEnabled.load() != 0;
-
-                    // Two ways to be told to start again: the interface bumping the refresh
-                    // counter, and the toggle changing under a layer that was running to see it.
-                    // The counter is the reliable one -- a toggle flipped while no game was
-                    // attached leaves no edge for anyone to notice -- and the edge is kept because
-                    // shaderglass-ctl writes the toggle without bumping anything.
-                    const uint32_t refresh = hdr->autoSourceRefresh.load();
-                    if (!sc.autoSourceRefreshSeeded) {
-                        sc.autoSourceRefreshSeeded = true;
-                        sc.autoSourceRefreshSeen = refresh;
-                    }
-                    const bool asked = refresh != sc.autoSourceRefreshSeen;
-                    if (asked || on != sc.autoSourceWasOn) {
-                        sc.autoSourceRefreshSeen = refresh;
-                        sc.autoSourceWasOn = on;
-                        sc.probeCandidateW = sc.probeCandidateH = 0;
-                        sc.lastProbeMs = 0.0;  // measure on the next frame, not in two seconds
-                        ForgetMeasuredSource(hdr);
-                    }
-
-                    if (on && sc.chain) {
-                        uint32_t every = hdr->autoSourceIntervalMs.load();
-                        if (!every) every = kAutoSourceDefaultMs;
-                        const double now = NowMs();
-                        if (now - sc.lastProbeMs >= double(every)) {
-                            sc.lastProbeMs = now;
-                            sc.chain->RequestGridProbe();
-                        }
-
-                        GridEstimate g {};
-                        if (sc.chain->TakeGridEstimate(&g)) {
-                            uint32_t aw = 0, ah = 0;
-                            if (GridToSourceExtent(g, sc.width, sc.height, &aw, &ah)) {
-                                const uint32_t curW = hdr->autoSourceWidth.load();
-                                const uint32_t curH = hdr->autoSourceHeight.load();
-                                // Applied on the strength of one measurement. An earlier version
-                                // waited for two in a row to agree, which was standing in for the
-                                // filtering the span guard and the raster floor now do properly --
-                                // and all it bought was a scene change taking two intervals to be
-                                // noticed, which is the opposite of what this is for.
-                                const bool changed = !Near(aw, curW) || !Near(ah, curH);
-
-                                if (changed) {
-                                    hdr->autoSourceScaleXBits.store(FloatToBits(g.scaleX));
-                                    hdr->autoSourceScaleYBits.store(FloatToBits(g.scaleY));
-                                    hdr->autoSourceConfidenceBits.store(FloatToBits(g.confidence));
-                                    hdr->autoSourceWidth.store(aw);
-                                    hdr->autoSourceHeight.store(ah);
-                                    hdr->autoSourceSeq.fetch_add(1);
-                                    Log("[source] measured %ux%u (x%.2f, y%.2f, confidence %.2f)",
-                                        aw, ah, double(g.scaleX), double(g.scaleY),
-                                        double(g.confidence));
-                                }
-                                sc.probeCandidateW = aw;
-                                sc.probeCandidateH = ah;
-                            } else {
-                                // Nothing measurable on this frame, and that is not news about the
-                                // game. A dark room, a movie, a fade, a menu over black -- none of
-                                // them mean the raster changed, because the raster is a property of
-                                // the game and not of the scene. The last answer stands.
-                                //
-                                // An earlier version dropped it after a run of such frames, on the
-                                // theory that a stale answer was worse than none. In a game it is
-                                // the other way round: walking into an unlit cave made the source
-                                // raster change underfoot, which is both visible and wrong. The way
-                                // out of a bad answer is the refresh request -- the toggle, or the
-                                // button -- which did not exist when that rule was written.
-                                sc.probeCandidateW = sc.probeCandidateH = 0;
-                            }
-                        }
-                    }
-                }
-
-                const uint32_t waitCount =
-                    waitsConsumed ? 0u : pPresentInfo->waitSemaphoreCount;
-                composed = ProcessPresent(dc, sc, queue, sc.images[pPresentInfo->pImageIndices[i]],
-                                          waitCount, pPresentInfo->pWaitSemaphores, sourceW,
-                                          sourceH, presetId);
-
-                // Set whether or not the chain succeeded: the submit waits on them before anything
-                // can fail, so they are consumed either way.
-                if (waitCount) waitsConsumed = true;
-
-                // Published every frame, so it appears as soon as there is something to say and
-                // disappears once there is not.
-                if (sc.chain && sc.chain->Usable()) {
-                    const char* notice = sc.chain->Notice();
-                    if (dc->lastNotice != notice) {
-                        dc->lastNotice = notice;
-                        ShmStoreString(dc->shm.hdr->layerReasonSeq, dc->shm.hdr->layerReason,
-                                       kReasonBytes, notice);
-                    }
-                }
-
-                if (!composed && sc.chain && !sc.chain->Usable()) {
-                    // The chain declared itself unusable on this device. Stop trying rather than
-                    // failing once a frame forever.
-                    ShmStoreString(dc->shm.hdr->layerReasonSeq, dc->shm.hdr->layerReason,
-                                   kReasonBytes, sc.chain->Reason());
-                    DestroySwapchainResources(dc, sc);
-                    sc.resourcesFailed = true;
-                }
-            }
-        } else if (!wantChain && sc.resourcesReady) {
-            // Switched off. Release the chain's memory rather than holding a frame's worth of
-            // surfaces for a game that is no longer being shaded.
-            DestroySwapchainResources(dc, sc);
-        }
-
-        const uint32_t state = sc.resourcesFailed ? kLayerFailed
-                               : composed         ? kLayerActive
-                                                  : kLayerIdle;
-        PublishStatus(dc, sc, state);
+        const uint32_t waitCount = waitsConsumed ? 0u : pPresentInfo->waitSemaphoreCount;
+        const FrameResult fr = ShadeFrame(
+            dc, sc, queue, sc.images[pPresentInfo->pImageIndices[i]], family, wantChain, paused,
+            /*submit=*/true, waitCount, pPresentInfo->pWaitSemaphores, VK_NULL_HANDLE,
+            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, (const void*) pPresentInfo->pSwapchains[i],
+            &waitsConsumed);
+        const bool composed = fr.composed;
+        const uint32_t state = fr.state;
 
         if (Verbose()) {
             Log("[present] swapchain=%p image=%u %ux%u state=%u composed=%d preset=%s",
@@ -1345,8 +1758,13 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
         }
     }
 
-    if (handledAny) NoteComposited(dc);
-    else if (skip) NoteSkip(dc, skip);
+    if (handledAny) {
+        NoteComposited(dc);
+        dc->composedSeq.store(seq);
+        dc->composedAny.store(true);
+    } else if (skip) {
+        NoteSkip(dc, skip);
+    }
 
     if (TimeEnabled()) {
         static int frameNo = 0;
@@ -1375,10 +1793,334 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
 // submitting on that queue itself. The lock bought nothing and cost a deadlock: all three of these
 // can block in the driver, and a device-wide lock held across a call that blocks on the GPU stops
 // every other thread on the device.
+// ---------------------------------------------------------------------------
+// gamescope's composite, on the backends that never present it
+// ---------------------------------------------------------------------------
+// These hooks are only handed out inside gamescope (see LookupHook). Everywhere else several of them
+// are hot paths -- vkCmdBindDescriptorSets runs thousands of times a frame in a game -- and a layer
+// that is loaded into every Vulkan program in the session has no business sitting in them.
+VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateImage(VkDevice device, const VkImageCreateInfo* info,
+                                                const VkAllocationCallbacks* alloc, VkImage* image) {
+    DeviceChain* dc = FindDevice(device);
+    if (!dc || !dc->table.vkCreateImage) return VK_ERROR_INITIALIZATION_FAILED;
+
+    // A screenshot or PipeWire texture is written by the composite but never read back on the GPU,
+    // so it is made without TransferSrc -- and the chain reads its target with a blit. Asked for here,
+    // and only for a format the chain can shade; if the driver will not have it, the texture is made
+    // as gamescope asked and simply not shaded.
+    VkResult r = VK_ERROR_FORMAT_NOT_SUPPORTED;
+    bool widened = false;
+    if (info && LayerEnabled() && IsGamescopeCaptureUsage(*info) && SupportedFormat(info->format)) {
+        VkImageCreateInfo wide = *info;
+        wide.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        r = dc->table.vkCreateImage(device, &wide, alloc, image);
+        widened = (r == VK_SUCCESS);
+    }
+    if (!widened) r = dc->table.vkCreateImage(device, info, alloc, image);
+    if (r == VK_SUCCESS && info) {
+        if (widened || !IsGamescopeCaptureUsage(*info)) dc->gamescope.OnCreateImage(*image, *info);
+        // Every storage image, kept or not, so that when gamescope changes how it makes its output
+        // images the log says what it makes now instead of simply finding nothing.
+        if (LayerEnabled() && Verbose() && (info->usage & VK_IMAGE_USAGE_STORAGE_BIT))
+            Log("[gamescope] image %p %ux%u fmt=%d usage=%#x %s", (void*) *image,
+                info->extent.width, info->extent.height, (int) info->format, info->usage,
+                IsGamescopeOutputUsage(*info) ? "output image"
+                : widened                     ? "capture texture"
+                                              : "not a target");
+    }
+    return r;
+}
+
+VKAPI_ATTR void VKAPI_CALL Hook_DestroyImage(VkDevice device, VkImage image,
+                                             const VkAllocationCallbacks* alloc) {
+    DeviceChain* dc = FindDevice(device);
+    if (!dc || !dc->table.vkDestroyImage) return;
+    dc->gamescope.OnDestroyImage(image);
+    dc->table.vkDestroyImage(device, image, alloc);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL Hook_BindImageMemory(VkDevice device, VkImage image,
+                                                    VkDeviceMemory memory, VkDeviceSize offset) {
+    DeviceChain* dc = FindDevice(device);
+    if (!dc || !dc->table.vkBindImageMemory) return VK_ERROR_INITIALIZATION_FAILED;
+    const VkResult r = dc->table.vkBindImageMemory(device, image, memory, offset);
+    if (r == VK_SUCCESS) dc->gamescope.OnBindMemory(image, memory);
+    return r;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateImageView(VkDevice device,
+                                                    const VkImageViewCreateInfo* info,
+                                                    const VkAllocationCallbacks* alloc,
+                                                    VkImageView* view) {
+    DeviceChain* dc = FindDevice(device);
+    if (!dc || !dc->table.vkCreateImageView) return VK_ERROR_INITIALIZATION_FAILED;
+    const VkResult r = dc->table.vkCreateImageView(device, info, alloc, view);
+    if (r == VK_SUCCESS && info) dc->gamescope.OnCreateView(*view, info->image);
+    return r;
+}
+
+VKAPI_ATTR void VKAPI_CALL Hook_DestroyImageView(VkDevice device, VkImageView view,
+                                                 const VkAllocationCallbacks* alloc) {
+    DeviceChain* dc = FindDevice(device);
+    if (!dc || !dc->table.vkDestroyImageView) return;
+    dc->gamescope.OnDestroyView(view);
+    dc->table.vkDestroyImageView(device, view, alloc);
+}
+
+VKAPI_ATTR void VKAPI_CALL Hook_UpdateDescriptorSets(VkDevice device, uint32_t writeCount,
+                                                     const VkWriteDescriptorSet* writes,
+                                                     uint32_t copyCount,
+                                                     const VkCopyDescriptorSet* copies) {
+    DeviceChain* dc = FindDevice(device);
+    if (!dc || !dc->table.vkUpdateDescriptorSets) return;
+    if (writes) dc->gamescope.OnUpdateSets(writeCount, writes);
+    dc->table.vkUpdateDescriptorSets(device, writeCount, writes, copyCount, copies);
+}
+
+VKAPI_ATTR void VKAPI_CALL Hook_CmdBindDescriptorSets(VkCommandBuffer cb, VkPipelineBindPoint point,
+                                                      VkPipelineLayout layout, uint32_t first,
+                                                      uint32_t count, const VkDescriptorSet* sets,
+                                                      uint32_t dynamicCount,
+                                                      const uint32_t* dynamicOffsets) {
+    DeviceChain* dc = DeviceForDispatch(cb);
+    if (!dc || !dc->table.vkCmdBindDescriptorSets) return;
+    if (sets) dc->gamescope.OnBindSets(cb, count, sets);
+    dc->table.vkCmdBindDescriptorSets(cb, point, layout, first, count, sets, dynamicCount,
+                                      dynamicOffsets);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL Hook_BeginCommandBuffer(VkCommandBuffer cb,
+                                                       const VkCommandBufferBeginInfo* info) {
+    DeviceChain* dc = DeviceForDispatch(cb);
+    if (!dc || !dc->table.vkBeginCommandBuffer) return VK_ERROR_INITIALIZATION_FAILED;
+    dc->gamescope.OnBeginCommandBuffer(cb);
+    {
+        // Recorded again without having been submitted: whatever it carried never ran.
+        std::lock_guard<std::mutex> lk(dc->lock);
+        dc->gamescopeCarriers.erase(cb);
+    }
+    return dc->table.vkBeginCommandBuffer(cb, info);
+}
+
+VKAPI_ATTR void VKAPI_CALL Hook_CmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint point,
+                                                VkPipeline pipeline) {
+    DeviceChain* dc = DeviceForDispatch(cb);
+    if (!dc || !dc->table.vkCmdBindPipeline) return;
+    dc->gamescope.OnBindPipeline(cb, point, pipeline);
+    dc->table.vkCmdBindPipeline(cb, point, pipeline);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateCommandPool(VkDevice device,
+                                                      const VkCommandPoolCreateInfo* info,
+                                                      const VkAllocationCallbacks* alloc,
+                                                      VkCommandPool* pool) {
+    DeviceChain* dc = FindDevice(device);
+    if (!dc || !dc->table.vkCreateCommandPool) return VK_ERROR_INITIALIZATION_FAILED;
+    const VkResult r = dc->table.vkCreateCommandPool(device, info, alloc, pool);
+    if (r == VK_SUCCESS && info) dc->gamescope.OnCreateCommandPool(*pool, info->queueFamilyIndex);
+    return r;
+}
+
+VKAPI_ATTR void VKAPI_CALL Hook_DestroyCommandPool(VkDevice device, VkCommandPool pool,
+                                                   const VkAllocationCallbacks* alloc) {
+    DeviceChain* dc = FindDevice(device);
+    if (!dc || !dc->table.vkDestroyCommandPool) return;
+    dc->gamescope.OnDestroyCommandPool(pool);
+    dc->table.vkDestroyCommandPool(device, pool, alloc);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL Hook_AllocateCommandBuffers(VkDevice device,
+                                                           const VkCommandBufferAllocateInfo* info,
+                                                           VkCommandBuffer* cbs) {
+    DeviceChain* dc = FindDevice(device);
+    if (!dc || !dc->table.vkAllocateCommandBuffers) return VK_ERROR_INITIALIZATION_FAILED;
+    const VkResult r = dc->table.vkAllocateCommandBuffers(device, info, cbs);
+    if (r == VK_SUCCESS && info)
+        dc->gamescope.OnAllocateCommandBuffers(info->commandPool, info->commandBufferCount, cbs);
+    return r;
+}
+
+VKAPI_ATTR void VKAPI_CALL Hook_FreeCommandBuffers(VkDevice device, VkCommandPool pool,
+                                                   uint32_t count, const VkCommandBuffer* cbs) {
+    DeviceChain* dc = FindDevice(device);
+    if (!dc || !dc->table.vkFreeCommandBuffers) return;
+    if (cbs) {
+        dc->gamescope.OnFreeCommandBuffers(count, cbs);
+        std::lock_guard<std::mutex> lk(dc->lock);
+        for (uint32_t i = 0; i < count; ++i) dc->gamescopeCarriers.erase(cbs[i]);
+    }
+    dc->table.vkFreeCommandBuffers(device, pool, count, cbs);
+}
+
+// gamescope's composite, shaded in place: the chain is recorded into gamescope's own command buffer,
+// right behind the dispatch that wrote the target. On gamescope's SDL backend the output images are
+// swapchain images, which are not tracked, and the present hook shades them instead -- so no frame is
+// shaded twice. Its screenshot and PipeWire textures are tracked on every backend.
+bool ShadeGamescopeDispatch(DeviceChain* dc, VkCommandBuffer cb) {
+    CompositeTarget target;
+    if (!dc->gamescope.ClaimDispatch(cb, &target)) return false;
+
+    uint32_t family = 0;
+    if (!dc->gamescope.FamilyOf(cb, &family)) return false;
+
+    std::lock_guard<std::mutex> lk(dc->lock);
+    if (!ShmOpen(dc->shm)) return false;
+    static std::once_flag namePublished;
+    std::call_once(namePublished, [dc] { PublishGameName(dc); });
+
+    // Never record graphics work for a queue that cannot run it. It would not fail -- it would hang
+    // the batch, and gamescope with it, waiting on a frame that never finishes. That happens when
+    // gamescope composites on a compute-only queue, which the environment variable set at instance
+    // creation normally prevents; if somebody set it to 0, this is where it is caught.
+    if (family >= dc->graphicsFamily.size() || !dc->graphicsFamily[family]) {
+        static std::once_flag said;
+        std::call_once(said, [] {
+            Log("[gamescope] composite runs on a compute-only queue, where the chain cannot; "
+                "passing frames through (set GAMESCOPE_FORCE_GENERAL_QUEUE=1)");
+        });
+        ShmStoreString(dc->shm.hdr->layerReasonSeq, dc->shm.hdr->layerReason, kReasonBytes,
+                       "gamescope composites on a compute-only queue; set "
+                       "GAMESCOPE_FORCE_GENERAL_QUEUE=1");
+        return false;
+    }
+
+    const auto key = std::make_tuple(target.width, target.height, target.format, int(target.kind));
+    auto [it, fresh] = dc->gamescopeTargets.try_emplace(key);
+    SwapchainState& sc = it->second;
+    if (fresh) {
+        // Screenshots come and go at sizes of their own. Rather than let every one leave a chain
+        // behind, a new capture size retires the other capture chains -- the display's is kept.
+        if (target.kind == TargetKind::kCapture)
+            for (auto o = dc->gamescopeTargets.begin(); o != dc->gamescopeTargets.end();) {
+                const bool other = &o->second != &sc && std::get<3>(o->first) == int(target.kind);
+                bool carried = false;
+                for (auto& c : dc->gamescopeCarriers) carried |= c.second == &o->second;
+                if (other && !carried) {
+                    if (o->second.fencePending)
+                        dc->table.vkWaitForFences(dc->self, 1, &o->second.fence, VK_TRUE,
+                                                  kFenceTimeoutNs);
+                    DestroySwapchainResources(dc, o->second);
+                    o = dc->gamescopeTargets.erase(o);
+                } else {
+                    ++o;
+                }
+            }
+        sc.width = target.width;
+        sc.height = target.height;
+        sc.format = target.format;
+        sc.passThrough = !SupportedFormat(target.format);
+        Log("[gamescope] shading its %s, %ux%u fmt=%d%s",
+            target.kind == TargetKind::kOutput ? "composite" : "capture composite", sc.width,
+            sc.height, (int) sc.format,
+            sc.passThrough ? " (unsupported format, passing through)" : "");
+    }
+    if (sc.passThrough) return false;
+
+    // Recorded on the render thread, with no queue in sight yet; the one it will be submitted to
+    // is only known at the submit. Any queue of the family serves for what ShadeFrame keeps.
+    const bool enabled = ShmEnabled(dc->shm.hdr);
+    const bool paused = dc->shm.hdr->paused.load() != 0;
+    const bool wantChain = enabled && !ShmPresetId(dc->shm.hdr).empty();
+    const FrameResult fr = ShadeFrame(dc, sc, VK_NULL_HANDLE, target.image, family, wantChain,
+                                      paused, /*submit=*/false, 0, nullptr, target.view,
+                                      VK_IMAGE_LAYOUT_GENERAL, (const void*) target.image, nullptr,
+                                      cb);
+
+    // The chain bound a compute pipeline of its own for the write-back. gamescope binds its
+    // descriptor sets and uniforms on every dispatch, but its pipeline only when it changes, so the
+    // next dispatch would run the layer's -- put gamescope's back.
+    if (const VkPipeline mine = dc->gamescope.ComputePipelineOf(cb))
+        dc->table.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, mine);
+
+    if (!fr.composed) return false;
+    dc->gamescopeCarriers[cb] = &sc;
+    return true;
+}
+
+VKAPI_ATTR void VKAPI_CALL Hook_CmdDispatch(VkCommandBuffer cb, uint32_t x, uint32_t y,
+                                            uint32_t z) {
+    DeviceChain* dc = DeviceForDispatch(cb);
+    if (!dc || !dc->table.vkCmdDispatch) return;
+    dc->table.vkCmdDispatch(cb, x, y, z);
+    if (dc->inert || !LayerEnabled()) return;
+    const bool shaded = ShadeGamescopeDispatch(dc, cb);
+    if (Verbose()) {
+        static std::atomic<uint64_t> seen {0}, hits {0};
+        const uint64_t n = seen.fetch_add(1) + 1;
+        if (shaded) hits.fetch_add(1);
+        if (n == 1 || n % 60 == 0)
+            Log("[gamescope] %llu dispatches, %llu shaded, %zu targets tracked",
+                (unsigned long long) n, (unsigned long long) hits.load(),
+                dc->gamescope.TrackedImages());
+    }
+}
+
+// The command buffers the chain was recorded into are gamescope's, submitted without a fence -- it
+// tracks completion with a timeline semaphore. The chain's fence, which says when its surfaces are
+// free to reuse, is put on the submission here; if gamescope passed a fence, an empty submission
+// after it carries the chain's instead, since a fence covers every earlier submission on the queue.
+template <typename Submit>
+VkResult SubmitCarrying(DeviceChain* dc, VkQueue queue, uint32_t count, const Submit* submits,
+                        VkFence fence, VkResult (*down)(DeviceChain*, VkQueue, uint32_t,
+                                                        const Submit*, VkFence),
+                        const std::vector<SwapchainState*>& carried) {
+    if (Verbose()) {
+        static std::atomic<uint64_t> n {0};
+        if (n.fetch_add(1) % 60 == 0)
+            Log("[gamescope] submission carries the chain (%zu), fence %s", carried.size(),
+                fence ? "gamescope's + ours" : "ours");
+    }
+    VkFence first = fence ? fence : carried[0]->fence;
+    VkResult r = down(dc, queue, count, submits, first);
+    if (r != VK_SUCCESS) return r;
+    for (size_t i = 0; i < carried.size(); ++i) {
+        if (!fence && i == 0) {
+            carried[i]->fencePending = true;
+            continue;
+        }
+        const VkResult e = dc->vkQueueSubmit(queue, 0, nullptr, carried[i]->fence);
+        if (e == VK_SUCCESS) carried[i]->fencePending = true;
+    }
+    return r;
+}
+
+std::vector<SwapchainState*> TakeCarried(DeviceChain* dc, const VkCommandBuffer* cbs,
+                                         uint32_t n, std::vector<SwapchainState*> carried) {
+    for (uint32_t c = 0; c < n; ++c) {
+        auto it = dc->gamescopeCarriers.find(cbs[c]);
+        if (it == dc->gamescopeCarriers.end()) continue;
+        if (std::find(carried.begin(), carried.end(), it->second) == carried.end())
+            carried.push_back(it->second);
+        dc->gamescopeCarriers.erase(it);
+    }
+    return carried;
+}
+
+VkResult DownSubmit(DeviceChain* dc, VkQueue q, uint32_t n, const VkSubmitInfo* s, VkFence f) {
+    return dc->vkQueueSubmit(q, n, s, f);
+}
+
+VkResult DownSubmit2(DeviceChain* dc, VkQueue q, uint32_t n, const VkSubmitInfo2* s, VkFence f) {
+    return dc->vkQueueSubmit2(q, n, s, f);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL Hook_QueueSubmit(VkQueue queue, uint32_t submitCount,
                                                 const VkSubmitInfo* pSubmits, VkFence fence) {
     DeviceChain* dc = DeviceForQueue(queue);
     if (!dc || !dc->vkQueueSubmit) return VK_ERROR_INITIALIZATION_FAILED;
+    AppCall call(dc);
+    if (InGamescope() && pSubmits) {
+        std::lock_guard<std::mutex> lk(dc->lock);
+        if (!dc->gamescopeCarriers.empty()) {
+            std::vector<SwapchainState*> carried;
+            for (uint32_t b = 0; b < submitCount; ++b)
+                carried = TakeCarried(dc, pSubmits[b].pCommandBuffers,
+                                      pSubmits[b].commandBufferCount, std::move(carried));
+            if (!carried.empty())
+                return SubmitCarrying(dc, queue, submitCount, pSubmits, fence, DownSubmit,
+                                      carried);
+        }
+    }
     return dc->vkQueueSubmit(queue, submitCount, pSubmits, fence);
 }
 
@@ -1386,13 +2128,38 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_QueueSubmit2(VkQueue queue, uint32_t submitC
                                                  const VkSubmitInfo2* pSubmits, VkFence fence) {
     DeviceChain* dc = DeviceForQueue(queue);
     if (!dc || !dc->vkQueueSubmit2) return VK_ERROR_INITIALIZATION_FAILED;
+    AppCall call(dc);
+    if (InGamescope() && pSubmits) {
+        std::lock_guard<std::mutex> lk(dc->lock);
+        if (!dc->gamescopeCarriers.empty()) {
+            std::vector<SwapchainState*> carried;
+            for (uint32_t b = 0; b < submitCount; ++b) {
+                std::vector<VkCommandBuffer> cbs;
+                for (uint32_t c = 0; c < pSubmits[b].commandBufferInfoCount; ++c)
+                    cbs.push_back(pSubmits[b].pCommandBufferInfos[c].commandBuffer);
+                carried = TakeCarried(dc, cbs.data(), uint32_t(cbs.size()), std::move(carried));
+            }
+            if (!carried.empty())
+                return SubmitCarrying(dc, queue, submitCount, pSubmits, fence, DownSubmit2,
+                                      carried);
+        }
+    }
     return dc->vkQueueSubmit2(queue, submitCount, pSubmits, fence);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL Hook_QueueWaitIdle(VkQueue queue) {
     DeviceChain* dc = DeviceForQueue(queue);
     if (!dc || !dc->vkQueueWaitIdle) return VK_ERROR_INITIALIZATION_FAILED;
+    AppCall call(dc);
     return dc->vkQueueWaitIdle(queue);
+}
+
+// Waiting for the device is a use of every one of its queues, as far as synchronisation goes.
+VKAPI_ATTR VkResult VKAPI_CALL Hook_DeviceWaitIdle(VkDevice device) {
+    DeviceChain* dc = FindDevice(device);
+    if (!dc || !dc->vkDeviceWaitIdle) return VK_ERROR_INITIALIZATION_FAILED;
+    AppCall call(dc);
+    return dc->vkDeviceWaitIdle(device);
 }
 
 // ---------------------------------------------------------------------------
@@ -1410,10 +2177,35 @@ PFN_vkVoidFunction LookupHook(const char* n) {
     if (!strcmp(n, "vkCreateSwapchainKHR")) return (PFN_vkVoidFunction) Hook_CreateSwapchainKHR;
     if (!strcmp(n, "vkDestroySwapchainKHR")) return (PFN_vkVoidFunction) Hook_DestroySwapchainKHR;
     if (!strcmp(n, "vkAcquireNextImageKHR")) return (PFN_vkVoidFunction) Hook_AcquireNextImageKHR;
+    if (!strcmp(n, "vkAcquireNextImage2KHR"))
+        return (PFN_vkVoidFunction) Hook_AcquireNextImage2KHR;
+    if (!strcmp(n, "vkDeviceWaitIdle")) return (PFN_vkVoidFunction) Hook_DeviceWaitIdle;
     if (!strcmp(n, "vkQueueSubmit")) return (PFN_vkVoidFunction) Hook_QueueSubmit;
     if (!strcmp(n, "vkQueueSubmit2")) return (PFN_vkVoidFunction) Hook_QueueSubmit2;
     if (!strcmp(n, "vkQueueWaitIdle")) return (PFN_vkVoidFunction) Hook_QueueWaitIdle;
     if (!strcmp(n, "vkQueuePresentKHR")) return (PFN_vkVoidFunction) Hook_QueuePresentKHR;
+
+    // Only inside gamescope. Anywhere else these are not in the chain at all, which is the only way to
+    // be sure they cost a game nothing.
+    if (InGamescope()) {
+        if (!strcmp(n, "vkCreateImage")) return (PFN_vkVoidFunction) Hook_CreateImage;
+        if (!strcmp(n, "vkDestroyImage")) return (PFN_vkVoidFunction) Hook_DestroyImage;
+        if (!strcmp(n, "vkBindImageMemory")) return (PFN_vkVoidFunction) Hook_BindImageMemory;
+        if (!strcmp(n, "vkCreateImageView")) return (PFN_vkVoidFunction) Hook_CreateImageView;
+        if (!strcmp(n, "vkDestroyImageView")) return (PFN_vkVoidFunction) Hook_DestroyImageView;
+        if (!strcmp(n, "vkUpdateDescriptorSets"))
+            return (PFN_vkVoidFunction) Hook_UpdateDescriptorSets;
+        if (!strcmp(n, "vkCmdBindDescriptorSets"))
+            return (PFN_vkVoidFunction) Hook_CmdBindDescriptorSets;
+        if (!strcmp(n, "vkBeginCommandBuffer")) return (PFN_vkVoidFunction) Hook_BeginCommandBuffer;
+        if (!strcmp(n, "vkCmdBindPipeline")) return (PFN_vkVoidFunction) Hook_CmdBindPipeline;
+        if (!strcmp(n, "vkCmdDispatch")) return (PFN_vkVoidFunction) Hook_CmdDispatch;
+        if (!strcmp(n, "vkCreateCommandPool")) return (PFN_vkVoidFunction) Hook_CreateCommandPool;
+        if (!strcmp(n, "vkDestroyCommandPool")) return (PFN_vkVoidFunction) Hook_DestroyCommandPool;
+        if (!strcmp(n, "vkAllocateCommandBuffers"))
+            return (PFN_vkVoidFunction) Hook_AllocateCommandBuffers;
+        if (!strcmp(n, "vkFreeCommandBuffers")) return (PFN_vkVoidFunction) Hook_FreeCommandBuffers;
+    }
     return nullptr;
 }
 

@@ -34,12 +34,15 @@ restarts it past whatever killed it, so one such preset does not hide the rest.
 #include "../layer/src/catalogue.h"
 #include "../layer/src/chain.h"
 #include "../layer/src/pixel_grid.h"
+#include "../layer/src/placement.h"
+#include "../common/shm_protocol.h"
 #include "../layer/src/vk_table.h"
 
 #include <dlfcn.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 #include <cstring>
 #include <string>
@@ -324,6 +327,341 @@ void WritePpm(const char* path, const uint8_t* bgra, uint32_t w, uint32_t h) {
         std::fwrite(rgb, 1, 3, f);
     }
     std::fclose(f);
+}
+
+// ---------------------------------------------------------------------------
+// Output placement, on a device
+// ---------------------------------------------------------------------------
+//
+// tests/placement_test.cpp proves the rectangles are right. This proves the GPU draws them: that the
+// blits land where the rectangles say, that the mirrors run the right way, that the bars are black
+// and stay inside the target, and -- the one most easily got backwards on paper -- that the quarter
+// turn is clockwise rather than anticlockwise or a mirror.
+//
+// The frame is 80x80 blocks, each its own colour, with red marking "picture" so that a black bar can
+// never be mistaken for a dark block. Every check samples a block's centre, far from any edge, so a
+// linear filter reads the same colour a nearest one would.
+namespace placementtest {
+
+constexpr uint32_t W = 640, H = 480, B = 80;
+
+struct Px {
+    int b, g, r;
+};
+
+Px BlockColour(int bx, int by) { return {10 + 30 * bx, 10 + 40 * by, 200}; }
+
+void Fill(uint8_t* bgra) {
+    for (uint32_t y = 0; y < H; ++y)
+        for (uint32_t x = 0; x < W; ++x) {
+            const Px c = BlockColour(int(x / B), int(y / B));
+            uint8_t* p = bgra + (size_t(y) * W + x) * 4;
+            p[0] = uint8_t(c.b);
+            p[1] = uint8_t(c.g);
+            p[2] = uint8_t(c.r);
+            p[3] = 255;
+        }
+}
+
+Px At(const uint8_t* bgra, int x, int y) {
+    const uint8_t* p = bgra + (size_t(y) * W + size_t(x)) * 4;
+    return {p[0], p[1], p[2]};
+}
+
+bool Near(Px a, Px b) {
+    return std::abs(a.b - b.b) <= 2 && std::abs(a.g - b.g) <= 2 && std::abs(a.r - b.r) <= 2;
+}
+
+// The colour the source had at (sx, sy): what the output is expected to show somewhere else.
+Px Source(int sx, int sy) { return BlockColour(sx / int(B), sy / int(B)); }
+
+}  // namespace placementtest
+
+// The whole suite, through one of the two routes the chain delivers a picture by: a copy into the
+// target, which every swapchain gets, or an imageStore through a storage view, which gamescope's
+// output images get because they carry Storage and not TransferDst. Same cases, same expected
+// pixels -- the route must not change the picture.
+int PlacementSuite(Device& d, VkFormat format, bool storage);
+
+int RunPlacementTests() {
+    Device d;
+    if (!CreateDevice(d)) return 2;
+    int failures = 0;
+    std::printf("-- copied into the target, as a swapchain is --\n");
+    failures += PlacementSuite(d, VK_FORMAT_B8G8R8A8_UNORM, false);
+    // rgba8 is what the write-back declares, as gamescope's compositor does, so the storage target
+    // is the format that qualifier names exactly.
+    std::printf("\n-- stored through a storage view, as gamescope's output images are --\n");
+    failures += PlacementSuite(d, VK_FORMAT_R8G8B8A8_UNORM, true);
+    std::printf("\n%s\n", failures ? "PLACEMENT FAILURES" : "all placement checks on the device passed");
+    return failures ? 1 : 0;
+}
+
+int PlacementSuite(Device& d, VkFormat format, bool storage) {
+    using namespace placementtest;
+    Image external {};
+    HostBuffer scratch {};
+    if (!MakeImage(&d.deviceTable, &d.instanceTable, d.device, d.physical, external, W, H, format,
+                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                       (storage ? VK_IMAGE_USAGE_STORAGE_BIT : 0)) ||
+        !MakeHostBuffer(&d.deviceTable, &d.instanceTable, d.device, d.physical, scratch,
+                        VkDeviceSize(W) * H * 4,
+                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
+        std::fprintf(stderr, "could not create the placement test's images\n");
+        return 2;
+    }
+    uint8_t* px = (uint8_t*) scratch.mapped;
+
+    const auto submitAndWait = [&d]() {
+        VkSubmitInfo si {};
+        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &d.cb;
+        d.deviceTable.vkQueueSubmit(d.queue, 1, &si, d.fence);
+        d.deviceTable.vkWaitForFences(d.device, 1, &d.fence, VK_TRUE, UINT64_MAX);
+        d.deviceTable.vkResetFences(d.device, 1, &d.fence);
+    };
+    VkCommandBufferBeginInfo begin {};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VkBufferImageCopy whole {};
+    whole.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    whole.imageExtent = {W, H, 1};
+
+    // The frame into the stand-in swapchain image, as a game would have drawn it.
+    const auto upload = [&]() {
+        d.deviceTable.vkBeginCommandBuffer(d.cb, &begin);
+        Transition(&d.deviceTable, d.cb, external, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        d.deviceTable.vkCmdCopyBufferToImage(d.cb, scratch.buffer, external.image,
+                                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &whole);
+        Transition(&d.deviceTable, d.cb, external, VK_IMAGE_LAYOUT_GENERAL);
+        d.deviceTable.vkEndCommandBuffer(d.cb);
+        submitAndWait();
+    };
+    const auto readback = [&]() {
+        d.deviceTable.vkBeginCommandBuffer(d.cb, &begin);
+        Transition(&d.deviceTable, d.cb, external, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        d.deviceTable.vkCmdCopyImageToBuffer(d.cb, external.image,
+                                             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, scratch.buffer,
+                                             1, &whole);
+        Transition(&d.deviceTable, d.cb, external, VK_IMAGE_LAYOUT_GENERAL);
+        d.deviceTable.vkEndCommandBuffer(d.cb);
+        submitAndWait();
+    };
+
+    int failures = 0;
+    struct Point {
+        int ox, oy;  // where to look in the output
+        Px want;
+    };
+
+    // Place the block pattern with `in`, then check every point.
+    // What happens after the first compose: nothing, a replay, or a hold -- the last two with the
+    // game having drawn a new, grey frame in between, which must not reach the screen.
+    // kRebuildHold rebuilds the chain in between -- first composed for another source raster, then
+    // prepared for the real one -- which is a preset or raster changed while the game is not
+    // presenting: the idle repaint's case.
+    enum class Then { kNothing, kReplay, kHold, kRebuildHold };
+    const auto run = [&](const char* name, PlacementInput in, const std::vector<Point>& points,
+                         Then then = Then::kNothing) {
+        in.swapW = W;
+        in.swapH = H;
+        const IRect t = TargetArea(W, H, in.cropEnabled, in.crop);
+        if (!in.sourceW) {
+            in.sourceW = t.w;
+            in.sourceH = t.h;
+        }
+        const Placement p = ComputePlacement(in);
+
+        Fill(px);
+        upload();
+
+        Chain chain(&d.deviceTable, &d.instanceTable, d.device, d.physical);
+        // MakeImage gives every image a view in its own format, which for the storage run is the
+        // rgba8 view the write-back needs -- the stand-in for the view gamescope binds.
+        if (storage) chain.SetStorageTarget(external.view);
+        PlacementInput first = in;
+        if (then == Then::kRebuildHold) {
+            first.sourceW = in.sourceW / 2;
+            first.sourceH = in.sourceH / 2;
+        }
+        bool ok = chain.Prepare(W, H, format, first.sourceW, first.sourceH,
+                                ComputePlacement(first), std::string());
+        if (ok) {
+            d.deviceTable.vkBeginCommandBuffer(d.cb, &begin);
+            ok = chain.Record(d.cb, external.image, 1, VK_IMAGE_LAYOUT_GENERAL);
+            d.deviceTable.vkEndCommandBuffer(d.cb);
+            submitAndWait();
+            chain.FrameCompleted();
+        }
+        if (ok && then != Then::kNothing) {
+            // A new frame from the game. A replay places the old result again; a hold runs every
+            // pass again, on the frame it kept. Either way the grey must not reach the screen.
+            std::memset(px, 90, size_t(W) * H * 4);
+            upload();
+            if (then == Then::kRebuildHold) {
+                ok = chain.Prepare(W, H, format, in.sourceW, in.sourceH, p, std::string()) &&
+                     chain.HoldsInput() && !chain.HasComposed();
+                if (!ok) std::printf("  FAIL  %-34s the rebuild did not keep the frame\n", name);
+            }
+            d.deviceTable.vkBeginCommandBuffer(d.cb, &begin);
+            ok = ok && then == Then::kReplay
+                     ? chain.RecordReplay(d.cb, external.image, VK_IMAGE_LAYOUT_GENERAL)
+                     : ok && chain.Record(d.cb, external.image, 1, VK_IMAGE_LAYOUT_GENERAL, true);
+            d.deviceTable.vkEndCommandBuffer(d.cb);
+            submitAndWait();
+            chain.FrameCompleted();
+        }
+        if (!ok) {
+            std::printf("  FAIL  %-34s did not build or record\n", name);
+            ++failures;
+            return;
+        }
+        readback();
+
+        int bad = 0;
+        for (const Point& q : points) {
+            const Px got = At(px, q.ox, q.oy);
+            if (Near(got, q.want)) continue;
+            if (bad++ < 3)
+                std::printf("  FAIL  %-34s at %d,%d got bgr %d,%d,%d wanted %d,%d,%d\n", name, q.ox,
+                            q.oy, got.b, got.g, got.r, q.want.b, q.want.g, q.want.r);
+        }
+        if (bad) ++failures;
+        else std::printf("  ok    %-34s %zu points\n", name, points.size());
+    };
+
+    const Px black {0, 0, 0};
+    std::vector<Point> pts;
+
+    std::printf("placement on the device, 640x480 in 80x80 blocks\n");
+
+    // Every block centre, for the cases that map the whole frame.
+    const auto everyBlock = [&](auto map) {
+        pts.clear();
+        for (int by = 0; by < int(H / B); ++by)
+            for (int bx = 0; bx < int(W / B); ++bx) {
+                const int ox = bx * int(B) + int(B) / 2, oy = by * int(B) + int(B) / 2;
+                int sx = 0, sy = 0;
+                map(ox, oy, &sx, &sy);
+                pts.push_back({ox, oy, Source(sx, sy)});
+            }
+        return pts;
+    };
+
+    run("identity", {}, everyBlock([](int x, int y, int* sx, int* sy) { *sx = x; *sy = y; }));
+
+    {
+        PlacementInput in;
+        in.flipH = true;
+        run("mirror horizontally", in,
+            everyBlock([](int x, int y, int* sx, int* sy) { *sx = int(W) - 1 - x; *sy = y; }));
+    }
+    {
+        PlacementInput in;
+        in.flipV = true;
+        run("mirror vertically", in,
+            everyBlock([](int x, int y, int* sx, int* sy) { *sx = x; *sy = int(H) - 1 - y; }));
+    }
+    {
+        PlacementInput in;
+        in.rotation = kRotate180;
+        run("half turn", in, everyBlock([](int x, int y, int* sx, int* sy) {
+                *sx = int(W) - 1 - x;
+                *sy = int(H) - 1 - y;
+            }));
+    }
+    {
+        // A quarter turn, clockwise. V is 480x640 -- the target on its side -- so the 640x480 source
+        // is drawn into it squeezed, then turned. For a source point (sx, sy):
+        //   V   = (sx * 480/640, sy * 640/480)
+        //   out = (639 - V.y, V.x)            (clockwise: V's top-left lands top-right)
+        // Worked for the four corner blocks, which is what tells clockwise from anticlockwise from a
+        // mirror: each of those three puts a different block in each corner.
+        PlacementInput in;
+        in.rotation = kRotate90;
+        const auto out = [](int sx, int sy) -> std::pair<int, int> {
+            return {639 - int(sy * 640 / 480), int(sx * 480 / 640)};
+        };
+        pts.clear();
+        for (auto [bx, by] : {std::pair {0, 0}, {7, 0}, {0, 5}, {7, 5}}) {
+            const int sx = bx * int(B) + int(B) / 2, sy = by * int(B) + int(B) / 2;
+            const auto [ox, oy] = out(sx, sy);
+            pts.push_back({ox, oy, BlockColour(bx, by)});
+        }
+        run("quarter turn, clockwise", in, pts);
+    }
+    {
+        // Double wide -- the Windows app's x0.5, pixels half as tall as they are wide -- makes the
+        // picture 640x240, fitted at y = 120. Bars above and below must be black; the picture between
+        // them is the source squeezed to half height.
+        PlacementInput in;
+        in.pixelHeight = 0.5f;
+        pts.clear();
+        for (int x : {40, 320, 600}) {
+            pts.push_back({x, 20, black});
+            pts.push_back({x, 460, black});
+            for (int sy : {40, 200, 440}) pts.push_back({x, 120 + sy / 2, Source(x, sy)});
+        }
+        run("double wide, letterboxed", in, pts);
+    }
+    {
+        // Half size, centred at one to one: 320x240 at (160, 120), black all round.
+        PlacementInput in;
+        in.pixelSize = 0.5f;
+        pts.clear();
+        for (auto [x, y] : {std::pair {20, 20}, {620, 20}, {20, 460}, {620, 460}, {80, 240},
+                            {560, 240}})
+            pts.push_back({x, y, black});
+        for (int vy : {20, 120, 220})
+            for (int vx : {20, 160, 300}) pts.push_back({160 + vx, 120 + vy, Source(vx * 2, vy * 2)});
+        run("pixel size x0.5, centred", in, pts);
+    }
+    {
+        // A crop mirrored inside itself, with everything outside it left exactly as the game drew.
+        PlacementInput in;
+        in.cropEnabled = true;
+        in.crop = {160, 80, 320, 240};
+        in.flipH = true;
+        pts.clear();
+        for (auto [x, y] : {std::pair {40, 40}, {600, 40}, {40, 440}, {600, 440}, {80, 200},
+                            {560, 200}})
+            pts.push_back({x, y, Source(x, y)});  // outside: untouched
+        for (int y : {120, 200, 280})
+            for (int x : {200, 320, 440}) pts.push_back({x, y, Source(160 + 479 - x, y)});
+        run("crop, mirrored inside itself", in, pts);
+    }
+    {
+        // Composed once, then the game draws a grey frame and the chain is asked to replay: the
+        // screen must still show the mirrored blocks, which is what a paused chain looks like.
+        PlacementInput in;
+        in.flipH = true;
+        run("replay over a new frame", in,
+            everyBlock([](int x, int y, int* sx, int* sy) { *sx = int(W) - 1 - x; *sy = y; }),
+            Then::kReplay);
+    }
+    {
+        // The same, paused: every pass runs again, but on the frame the chain kept.
+        PlacementInput in;
+        in.flipH = true;
+        run("hold over a new frame", in,
+            everyBlock([](int x, int y, int* sx, int* sy) { *sx = int(W) - 1 - x; *sy = y; }),
+            Then::kHold);
+    }
+    {
+        // Held across a rebuild: the frame the game last drew survives the chain being built again,
+        // and the grey one it drew since is still not what is shown.
+        PlacementInput in;
+        in.flipH = true;
+        run("hold across a rebuild", in,
+            everyBlock([](int x, int y, int* sx, int* sy) { *sx = int(W) - 1 - x; *sy = y; }),
+            Then::kRebuildHold);
+    }
+
+    DropImage(&d.deviceTable, d.device, external);
+    DropHostBuffer(&d.deviceTable, d.device, scratch);
+    return failures;
 }
 
 int RunRange(const std::vector<std::string>& ids, size_t from, uint32_t width, uint32_t height,
@@ -641,6 +979,7 @@ int main(int argc, char** argv) {
         else if (arg == "--dump" && i + 1 < argc) dumpDir = argv[++i];
         else if (arg == "--stats") stats = true;
         else if (arg == "--probe") probe = true;
+        else if (arg == "--placement") return LoadLoader() ? RunPlacementTests() : 2;
         else only.push_back(arg);
     }
     if (!stride) stride = 1;

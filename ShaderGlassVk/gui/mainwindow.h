@@ -29,6 +29,7 @@ class CaptureView;
 class QCheckBox;
 class QComboBox;
 class QLabel;
+class QLineEdit;
 class QPushButton;
 class QTimer;
 
@@ -45,6 +46,9 @@ class MainWindow : public QWidget {
     bool AttachShm();
     QWidget* BuildShaderTab();
     QWidget* BuildInputTab();
+    QWidget* BuildOutputTab();
+    QWidget* BuildAdvancedTab();
+    void UpdateLaunchCommand();
     void UpdateStatus();
     void ChoosePreset(const QString& id);
 
@@ -73,11 +77,20 @@ class MainWindow : public QWidget {
     QLabel* _status = nullptr;
     QLabel* _notice = nullptr;
     QLabel* _autoSourceLabel = nullptr;
+
+    // The gamescope launch-options helper on the Advanced tab.
+    QComboBox* _launchWhere = nullptr;
+    QLineEdit* _gamescopeBinary = nullptr;  // a custom build; empty for the one on PATH
+    QCheckBox* _launchNearest = nullptr;
+    QLineEdit* _launchLine = nullptr;
+    QLabel* _launchNote = nullptr;
     QLabel* _presetLabel = nullptr;
     QTimer* _timer = nullptr;
 
     QString _currentPreset;
     bool _captureVisible = false;
+    bool _outputVisible = false;
+    class CropPicker* _cropPicker = nullptr;  // on the Output tab, fed the newest capture
     uint32_t _lastHeartbeat = 0;
     int _idleTicks = 0;
 

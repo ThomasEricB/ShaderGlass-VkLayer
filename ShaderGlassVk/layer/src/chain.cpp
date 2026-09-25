@@ -48,6 +48,20 @@ const float kMvp[16] = {
     -1.0f, -1.0f, 0.0f, 1.0f  //
 };
 
+// The same quad turned a quarter clockwise, for the chain's own turn pass. The source's top-left must
+// land at the output's top-right, so position (0,0) maps to clip (1,-1) and (1,0) to (1,1):
+//
+//   clip.x = 1 - 2*y        clip.y = 2*x - 1
+//
+// The 2x2 part has determinant 4, the same sign as kMvp's, so the triangles keep their winding and
+// nothing is culled that was not before.
+const float kMvpTurn[16] = {
+    0.0f, 2.0f, 0.0f, 0.0f,   //
+    -2.0f, 0.0f, 0.0f, 0.0f,  //
+    0.0f, 0.0f, 1.0f, 0.0f,   //
+    1.0f, -1.0f, 0.0f, 1.0f   //
+};
+
 // Bytes a pixel, for the formats the chain works in.
 uint32_t FormatBytes(VkFormat f) {
     switch (f) {
@@ -230,7 +244,10 @@ Chain::Chain(const DeviceTable* vk, const InstanceTable* instance, VkDevice devi
     _usable = true;
 }
 
-Chain::~Chain() { DropAll(); }
+Chain::~Chain() {
+    DropAll();
+    DropWriteback();
+}
 
 void Chain::DropSized() {
     for (auto& pass : _passes) {
@@ -246,6 +263,7 @@ void Chain::DropSized() {
     _history.clear();
 
     DropImage(_vk, _device, _frame);
+    DropImage(_vk, _device, _keptFrame);
     DropImage(_vk, _device, _originalScaled);
 
     DropHostBuffer(_vk, _device, _selfTest);
@@ -266,6 +284,8 @@ void Chain::DropAll() {
 
     for (auto& lut : _luts) DropImage(_vk, _device, lut.image);
     _luts.clear();
+    DropImage(_vk, _device, _black);
+    DropImage(_vk, _device, _placed);
 
     for (auto& kv : _samplers) _vk->vkDestroySampler(_device, kv.second, nullptr);
     _samplers.clear();
@@ -342,7 +362,19 @@ VkFormat Chain::FormatFor(const Pass& pass, bool last) const {
 
 bool Chain::BuildPasses(const SgPreset* preset) {
     const size_t count = preset ? preset->pass_count : 1;
-    _passes.resize(count);
+    _userPassCount = count;
+    // One more when the output is turned: the chain's own pass, which the preset never sees and
+    // which, coming last, shifts none of the PassOutput indices the preset's passes refer to.
+    _passes.resize(count + (_quarterTurn ? 1 : 0));
+    if (_quarterTurn) {
+        Pass& turn = _passes[count];
+        turn = Pass {};
+        turn.name = "turn";
+        turn.turn = true;
+        // Nearest: a quarter turn at one to one maps every pixel onto exactly one pixel, and a
+        // linear filter would only blur it.
+        turn.filterLinear = false;
+    }
 
     for (size_t i = 0; i < count; ++i) {
         Pass& pass = _passes[i];
@@ -840,17 +872,22 @@ bool Chain::BuildPassPipeline(Pass& pass, uint32_t index) {
 }
 
 bool Chain::BuildPassImages(Pass& pass, uint32_t index) {
-    const bool last = (index + 1 == _passes.size());
+    // The preset's last pass writes what goes on screen, so it renders at the view -- libretro's
+    // viewport. That used to be the swapchain itself; with a pixel size, an aspect correction or a
+    // crop it is its own size, and placing it is a separate step.
+    const bool lastOfPreset = (index + 1 == _userPassCount);
 
-    if (last) {
-        // The final pass writes what goes on screen, so it renders at the swapchain's raster.
-        pass.width = _swapWidth;
-        pass.height = _swapHeight;
+    if (pass.turn) {
+        pass.width = _viewHeight;  // the view on its side
+        pass.height = _viewWidth;
+    } else if (lastOfPreset) {
+        pass.width = _viewWidth;
+        pass.height = _viewHeight;
     } else {
         const uint32_t inW = index == 0 ? _sourceWidth : _passes[index - 1].width;
         const uint32_t inH = index == 0 ? _sourceHeight : _passes[index - 1].height;
-        ScaledSize(pass.scaleTypeX, pass.scaleX, pass.scaleTypeY, pass.scaleY, inW, inH, _swapWidth,
-                   _swapHeight, &pass.width, &pass.height);
+        ScaledSize(pass.scaleTypeX, pass.scaleX, pass.scaleTypeY, pass.scaleY, inW, inH, _viewWidth,
+                   _viewHeight, &pass.width, &pass.height);
     }
 
     const VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
@@ -907,11 +944,30 @@ bool Chain::BuildPassImages(Pass& pass, uint32_t index) {
 
 bool Chain::Prepare(uint32_t swapWidth, uint32_t swapHeight, VkFormat swapFormat,
                     uint32_t sourceWidth, uint32_t sourceHeight, const std::string& presetId) {
+    Placement identity;
+    identity.target = {0, 0, swapWidth, swapHeight};
+    identity.viewW = swapWidth;
+    identity.viewH = swapHeight;
+    identity.src = identity.target;
+    identity.dst = identity.target;
+    identity.nearest = true;
+    return Prepare(swapWidth, swapHeight, swapFormat, sourceWidth, sourceHeight, identity, presetId);
+}
+
+bool Chain::Prepare(uint32_t swapWidth, uint32_t swapHeight, VkFormat swapFormat,
+                    uint32_t sourceWidth, uint32_t sourceHeight, const Placement& placement,
+                    const std::string& presetId) {
     if (!_usable) return false;
+    if (!placement.Valid()) return false;
+
+    // Where it lands, the bars and the mirrors take effect on the next record without a rebuild.
+    _placement = placement;
 
     if (_swapWidth == swapWidth && _swapHeight == swapHeight && _swapFormat == swapFormat &&
         _sourceWidth == sourceWidth && _sourceHeight == sourceHeight && _presetId == presetId &&
-        _frame.image)
+        _targetWidth == placement.target.w && _targetHeight == placement.target.h &&
+        _viewWidth == placement.viewW && _viewHeight == placement.viewH &&
+        _quarterTurn == placement.quarterTurn && _frame.image)
         return true;
 
     // Every internal surface uses the swapchain format's UNORM twin: sampling an _SRGB view would
@@ -937,7 +993,16 @@ bool Chain::Prepare(uint32_t swapWidth, uint32_t swapHeight, VkFormat swapFormat
         return false;
     }
 
+    // The frame the game last presented, kept through the rebuild when it can be reused as it is.
+    Image kept {};
+    if (_inputHeld && _frame.image && _frame.format == chainFormat && _frame.width == swapWidth &&
+        _frame.height == swapHeight) {
+        kept = _frame;
+        _frame = Image {};
+    }
+
     DropAll();
+    _keptFrame = kept;
 
     _chainFormat = chainFormat;
     _swapWidth = swapWidth;
@@ -945,6 +1010,13 @@ bool Chain::Prepare(uint32_t swapWidth, uint32_t swapHeight, VkFormat swapFormat
     _swapFormat = swapFormat;
     _sourceWidth = sourceWidth;
     _sourceHeight = sourceHeight;
+    _targetWidth = placement.target.w;
+    _targetHeight = placement.target.h;
+    _viewWidth = placement.viewW;
+    _viewHeight = placement.viewH;
+    _quarterTurn = placement.quarterTurn;
+    _composed = false;
+    _inputHeld = false;
     _presetId = presetId;
 
     // A named preset that is not in the catalogue is not a reason to stop: the chain falls back to
@@ -974,10 +1046,21 @@ bool Chain::Prepare(uint32_t swapWidth, uint32_t swapHeight, VkFormat swapFormat
 
     const uint32_t originalLevels =
         _originalMipmapped ? MipLevelsFor(_sourceWidth, _sourceHeight) : 1u;
-    const bool scaled = (_sourceWidth != _swapWidth || _sourceHeight != _swapHeight);
+    // A separate Original whenever the chain must not simply sample the whole frame: the source is a
+    // different size, or it is a crop of the frame rather than all of it.
+    const bool scaled = (_sourceWidth != _targetWidth || _sourceHeight != _targetHeight ||
+                         _targetWidth != _swapWidth || _targetHeight != _swapHeight);
 
-    ok = ok && MakeImage(_vk, _instance, _device, _physical, _frame, _swapWidth, _swapHeight,
-                         _chainFormat, sampled | dst | src, scaled ? 1u : originalLevels);
+    const uint32_t frameLevels = scaled ? 1u : originalLevels;
+    if (ok && _keptFrame.image && _keptFrame.levels == frameLevels) {
+        _frame = _keptFrame;
+        _keptFrame = Image {};
+        _inputHeld = true;
+    } else {
+        DropImage(_vk, _device, _keptFrame);
+        ok = ok && MakeImage(_vk, _instance, _device, _physical, _frame, _swapWidth, _swapHeight,
+                             _chainFormat, sampled | dst | src, frameLevels);
+    }
     if (ok && scaled)
         ok = MakeImage(_vk, _instance, _device, _physical, _originalScaled, _sourceWidth,
                        _sourceHeight, _chainFormat, sampled | dst | src, originalLevels);
@@ -991,6 +1074,10 @@ bool Chain::Prepare(uint32_t swapWidth, uint32_t swapHeight, VkFormat swapFormat
             ok = BuildPassPipeline(_passes[i], i) && BuildPassImages(_passes[i], i);
     ok = ok && BuildLuts(_preset);
     ok = ok && BuildHistory();
+    ok = ok && MakeImage(_vk, _instance, _device, _physical, _black, 1, 1, _chainFormat,
+                         src | dst | sampled, 1);
+    ok = ok && MakeImage(_vk, _instance, _device, _physical, _placed, _swapWidth, _swapHeight,
+                         _chainFormat, src | dst | sampled, 1);
 
     if (ok && SelfTestWanted()) {
         _selfTestHalf = VkDeviceSize(_swapWidth) * _swapHeight * FormatBytes(_chainFormat);
@@ -1181,7 +1268,8 @@ void Chain::WriteUniforms(Pass& pass, size_t passIndex, uint64_t frameCount, con
 
         switch (slot.semantic) {
             case UniformSemantic::kMvp:
-                if (slot.size >= sizeof(kMvp)) std::memcpy(base + slot.offset, kMvp, sizeof(kMvp));
+                if (slot.size >= sizeof(kMvp))
+                    std::memcpy(base + slot.offset, pass.turn ? kMvpTurn : kMvp, sizeof(kMvp));
                 break;
 
             case UniformSemantic::kFrameCount: {
@@ -1257,7 +1345,7 @@ void Chain::WriteUniforms(Pass& pass, size_t passIndex, uint64_t frameCount, con
 
             case UniformSemantic::kFinalViewportSize: {
                 float v[4];
-                FillSize(v, _swapWidth, _swapHeight);
+                FillSize(v, _viewWidth, _viewHeight);
                 if (slot.size >= sizeof(v)) std::memcpy(base + slot.offset, v, sizeof(v));
                 break;
             }
@@ -1408,7 +1496,7 @@ void Chain::RecordPass(VkCommandBuffer cb, size_t passIndex, uint32_t slot, uint
 }
 
 bool Chain::Record(VkCommandBuffer cb, VkImage swapchainImage, uint64_t frameCount,
-                   VkImageLayout externalLayout) {
+                   VkImageLayout externalLayout, bool keepInput) {
     if (!_usable || !_frame.image || _passes.empty()) return false;
 
     const uint32_t slot = _slot;
@@ -1428,21 +1516,25 @@ bool Chain::Record(VkCommandBuffer cb, VkImage swapchainImage, uint64_t frameCou
     }
 
     // ---- the frame, as the game presented it ----
-    TransitionForeign(_vk, cb, swapchainImage, externalLayout,
-                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    Transition(_vk, cb, _frame, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    // Unless the chain is holding the one it has, which it can only do once there is one.
+    if (!keepInput || !_inputHeld) {
+        TransitionForeign(_vk, cb, swapchainImage, externalLayout,
+                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        Transition(_vk, cb, _frame, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 
-    VkImageCopy copy {};
-    copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copy.extent = {_swapWidth, _swapHeight, 1};
-    _vk->vkCmdCopyImage(cb, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, _frame.image,
-                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        VkImageCopy copy {};
+        copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.extent = {_swapWidth, _swapHeight, 1};
+        _vk->vkCmdCopyImage(cb, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, _frame.image,
+                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
 
-    // Straight back, so every path out of here -- including the ones that give up -- leaves the
-    // image in the layout the presentation engine requires.
-    TransitionForeign(_vk, cb, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                      externalLayout);
+        // Straight back, so every path out of here -- including the ones that give up -- leaves
+        // the image in the layout the presentation engine requires.
+        TransitionForeign(_vk, cb, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                          externalLayout);
+        _inputHeld = true;
+    }
 
     // ---- one-time work, on the first frame after a build ----
     if (_clearPending) {
@@ -1464,6 +1556,11 @@ bool Chain::Record(VkCommandBuffer cb, VkImage swapchainImage, uint64_t frameCou
             Transition(_vk, cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             _vk->vkCmdClearColorImage(cb, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1,
                                       &range);
+        }
+        if (_black.image) {
+            Transition(_vk, cb, _black, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            _vk->vkCmdClearColorImage(cb, _black.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black,
+                                      1, &range);
         }
         _clearPending = false;
     }
@@ -1511,7 +1608,11 @@ bool Chain::Record(VkCommandBuffer cb, VkImage swapchainImage, uint64_t frameCou
         VkImageBlit blit {};
         blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        blit.srcOffsets[1] = {(int32_t) _swapWidth, (int32_t) _swapHeight, 1};
+        // The target rectangle, not the whole frame: with a crop the chain only ever sees the part
+        // of the picture it is going to write back over.
+        const IRect& t = _placement.target;
+        blit.srcOffsets[0] = {t.x, t.y, 0};
+        blit.srcOffsets[1] = {t.x + (int32_t) t.w, t.y + (int32_t) t.h, 1};
         blit.dstOffsets[1] = {(int32_t) _sourceWidth, (int32_t) _sourceHeight, 1};
         _vk->vkCmdBlitImage(cb, _frame.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                             _originalScaled.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
@@ -1547,7 +1648,10 @@ bool Chain::Record(VkCommandBuffer cb, VkImage swapchainImage, uint64_t frameCou
     // Both copies are taken from what the chain actually consumed and produced, before anything
     // else touches either, so a mismatch can only come from the chain itself.
     _selfTestRecorded = false;
-    if (_selfTestHalf && _selfTest.buffer && !_selfTestReported) {
+    // Only at the identity placement, where the last pass is the swapchain's size. Anywhere else
+    // there is no bit-exact answer to compare against, and copying the swapchain's extent out of a
+    // smaller image would read past its end.
+    if (_selfTestHalf && _selfTest.buffer && !_selfTestReported && IsIdentityPlacement()) {
         Transition(_vk, cb, _frame, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         Transition(_vk, cb, last, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
 
@@ -1563,6 +1667,7 @@ bool Chain::Record(VkCommandBuffer cb, VkImage swapchainImage, uint64_t frameCou
     }
 
     // ---- a requested capture ----
+    bool captureAfter = false;
     if (_captureArmed) {
         _captureArmed = false;
         const VkDeviceSize half = VkDeviceSize(_swapWidth) * _swapHeight * 4;
@@ -1577,17 +1682,16 @@ bool Chain::Record(VkCommandBuffer cb, VkImage swapchainImage, uint64_t frameCou
 
         if (_capture.buffer && FormatBytes(_chainFormat) == 4) {
             Transition(_vk, cb, _frame, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-            Transition(_vk, cb, last, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
 
             VkBufferImageCopy r {};
             r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             r.imageExtent = {_swapWidth, _swapHeight, 1};
             _vk->vkCmdCopyImageToBuffer(cb, _frame.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                         _capture.buffer, 1, &r);
-            r.bufferOffset = half;
-            _vk->vkCmdCopyImageToBuffer(cb, last.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                        _capture.buffer, 1, &r);
-            _capturePending = true;
+            // The "after" half is taken from the swapchain once the picture has been placed, not
+            // from the last pass. The last pass is the view's size, which is no longer the
+            // swapchain's, and what the user wants to compare is what reached the screen.
+            captureAfter = true;
         } else {
             Log("[capture] no room, or a format this cannot write");
         }
@@ -1643,13 +1747,22 @@ bool Chain::Record(VkCommandBuffer cb, VkImage swapchainImage, uint64_t frameCou
     }
 
     // ---- back into the swapchain ----
-    Transition(_vk, cb, last, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    TransitionForeign(_vk, cb, swapchainImage, externalLayout,
-                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    _vk->vkCmdCopyImage(cb, last.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, swapchainImage,
-                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-    TransitionForeign(_vk, cb, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                      externalLayout);
+    RecordOutput(cb, swapchainImage, externalLayout);
+    _composed = true;
+
+    if (captureAfter) {
+        TransitionForeign(_vk, cb, swapchainImage, externalLayout,
+                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        VkBufferImageCopy r {};
+        r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        r.imageExtent = {_swapWidth, _swapHeight, 1};
+        r.bufferOffset = _captureHalf;
+        _vk->vkCmdCopyImageToBuffer(cb, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                    _capture.buffer, 1, &r);
+        TransitionForeign(_vk, cb, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                          externalLayout);
+        _capturePending = true;
+    }
 
     // ---- what the next frame inherits ----
     if (!_history.empty()) {
@@ -1799,6 +1912,245 @@ void Chain::FrameCompleted() {
     WriteCapture();
     ReadGridProbe();
     ConsumeSelfTest();
+}
+
+bool Chain::IsIdentityPlacement() const {
+    const Placement& p = _placement;
+    const IRect whole {0, 0, _swapWidth, _swapHeight};
+    return p.target == whole && p.dst == whole && p.src == whole && _viewWidth == _swapWidth &&
+           _viewHeight == _swapHeight && !_quarterTurn && !p.flipH && !p.flipV && p.barCount == 0;
+}
+
+// The last pass's result, into the swapchain. At the identity placement that is one raw copy, which
+// is exactly what the chain always did -- and the path the self-test proves bit-exact. Anything else
+// is composed first.
+void Chain::RecordOutput(VkCommandBuffer cb, VkImage swapchainImage, VkImageLayout externalLayout) {
+    if (_storageView) {
+        RecordWriteback(cb, swapchainImage, externalLayout);
+        return;
+    }
+    if (!IsIdentityPlacement()) {
+        RecordPlacement(cb, swapchainImage, externalLayout);
+        return;
+    }
+
+    Image& last = _passes.back().output[_passes.back().current];
+    Transition(_vk, cb, last, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    TransitionForeign(_vk, cb, swapchainImage, externalLayout,
+                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkImageCopy copy {};
+    copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.extent = {_swapWidth, _swapHeight, 1};
+    _vk->vkCmdCopyImage(cb, last.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, swapchainImage,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    TransitionForeign(_vk, cb, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                      externalLayout);
+}
+
+void Chain::RecordPlacement(VkCommandBuffer cb, VkImage swapchainImage,
+                            VkImageLayout externalLayout) {
+    ComposePlaced(cb);
+
+    // The target rectangle, raw, into the swapchain.
+    const Placement& p = _placement;
+    const VkImageSubresourceLayers layers {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    Transition(_vk, cb, _placed, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    TransitionForeign(_vk, cb, swapchainImage, externalLayout,
+                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkImageCopy copy {};
+    copy.srcSubresource = layers;
+    copy.dstSubresource = layers;
+    copy.srcOffset = {p.target.x, p.target.y, 0};
+    copy.dstOffset = {p.target.x, p.target.y, 0};
+    copy.extent = {p.target.w, p.target.h, 1};
+    _vk->vkCmdCopyImage(cb, _placed.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, swapchainImage,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    TransitionForeign(_vk, cb, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                      externalLayout);
+}
+
+// The placed picture -- bars, turn, mirrors, scale -- composed into _placed, ready to go out by
+// whichever route the target allows.
+void Chain::ComposePlaced(VkCommandBuffer cb) {
+    const Placement& p = _placement;
+    Image& shown = _passes.back().output[_passes.back().current];
+    const VkImageSubresourceLayers layers {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+
+    Transition(_vk, cb, _placed, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+    // The bars around a letterboxed picture. Only inside the target: outside a crop the game's own
+    // frame stays exactly as it was.
+    if (p.barCount && _black.image) {
+        Transition(_vk, cb, _black, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        for (uint32_t i = 0; i < p.barCount; ++i) {
+            const IRect& b = p.bars[i];
+            VkImageBlit bar {};
+            bar.srcSubresource = layers;
+            bar.dstSubresource = layers;
+            bar.srcOffsets[1] = {1, 1, 1};
+            bar.dstOffsets[0] = {b.x, b.y, 0};
+            bar.dstOffsets[1] = {b.x + int32_t(b.w), b.y + int32_t(b.h), 1};
+            _vk->vkCmdBlitImage(cb, _black.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                _placed.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bar,
+                                VK_FILTER_NEAREST);
+        }
+    }
+
+    // The picture. Mirroring is free: a blit whose destination offsets run backwards draws the
+    // source reversed, so a flip is two numbers swapped rather than another pass.
+    Transition(_vk, cb, shown, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    int32_t x0 = p.dst.x, x1 = p.dst.x + int32_t(p.dst.w);
+    int32_t y0 = p.dst.y, y1 = p.dst.y + int32_t(p.dst.h);
+    if (p.flipH) std::swap(x0, x1);
+    if (p.flipV) std::swap(y0, y1);
+
+    VkImageBlit blit {};
+    blit.srcSubresource = layers;
+    blit.dstSubresource = layers;
+    blit.srcOffsets[0] = {p.src.x, p.src.y, 0};
+    blit.srcOffsets[1] = {p.src.x + int32_t(p.src.w), p.src.y + int32_t(p.src.h), 1};
+    blit.dstOffsets[0] = {x0, y0, 0};
+    blit.dstOffsets[1] = {x1, y1, 1};
+    _vk->vkCmdBlitImage(cb, shown.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, _placed.image,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                        p.nearest ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
+}
+
+bool Chain::BuildWriteback() {
+    if (_wbPipeline) return true;
+
+    VkDescriptorSetLayoutBinding b[2] {};
+    b[0].binding = 0;
+    b[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    b[0].descriptorCount = 1;
+    b[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    b[1].binding = 1;
+    b[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    b[1].descriptorCount = 1;
+    b[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutCreateInfo sl {};
+    sl.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    sl.bindingCount = 2;
+    sl.pBindings = b;
+    if (_vk->vkCreateDescriptorSetLayout(_device, &sl, nullptr, &_wbSetLayout) != VK_SUCCESS)
+        return false;
+
+    VkPushConstantRange pc {VK_SHADER_STAGE_COMPUTE_BIT, 0, 4 * sizeof(int32_t)};
+    VkPipelineLayoutCreateInfo pl {};
+    pl.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pl.setLayoutCount = 1;
+    pl.pSetLayouts = &_wbSetLayout;
+    pl.pushConstantRangeCount = 1;
+    pl.pPushConstantRanges = &pc;
+    if (_vk->vkCreatePipelineLayout(_device, &pl, nullptr, &_wbLayout) != VK_SUCCESS) return false;
+
+    VkShaderModuleCreateInfo sm {};
+    sm.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    sm.codeSize = kWritebackCompSpvLen * sizeof(uint32_t);
+    sm.pCode = kWritebackCompSpv;
+    VkShaderModule module = VK_NULL_HANDLE;
+    if (_vk->vkCreateShaderModule(_device, &sm, nullptr, &module) != VK_SUCCESS) return false;
+
+    VkComputePipelineCreateInfo cp {};
+    cp.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    cp.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cp.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cp.stage.module = module;
+    cp.stage.pName = "main";
+    cp.layout = _wbLayout;
+    const VkResult made =
+        _vk->vkCreateComputePipelines(_device, VK_NULL_HANDLE, 1, &cp, nullptr, &_wbPipeline);
+    _vk->vkDestroyShaderModule(_device, module, nullptr);
+    if (made != VK_SUCCESS) return false;
+
+    VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
+                                     {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1}};
+    VkDescriptorPoolCreateInfo dp {};
+    dp.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dp.maxSets = 1;
+    dp.poolSizeCount = 2;
+    dp.pPoolSizes = sizes;
+    if (_vk->vkCreateDescriptorPool(_device, &dp, nullptr, &_wbPool) != VK_SUCCESS) return false;
+    VkDescriptorSetAllocateInfo da {};
+    da.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    da.descriptorPool = _wbPool;
+    da.descriptorSetCount = 1;
+    da.pSetLayouts = &_wbSetLayout;
+    if (_vk->vkAllocateDescriptorSets(_device, &da, &_wbSet) != VK_SUCCESS) return false;
+
+    // texelFetch ignores filtering, but a combined image sampler still needs a sampler.
+    VkSamplerCreateInfo si {};
+    si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    si.magFilter = si.minFilter = VK_FILTER_NEAREST;
+    si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    si.maxLod = 0.0f;
+    return _vk->vkCreateSampler(_device, &si, nullptr, &_wbSampler) == VK_SUCCESS;
+}
+
+void Chain::DropWriteback() {
+    if (_wbSampler) _vk->vkDestroySampler(_device, _wbSampler, nullptr);
+    if (_wbPool) _vk->vkDestroyDescriptorPool(_device, _wbPool, nullptr);  // frees _wbSet with it
+    if (_wbPipeline) _vk->vkDestroyPipeline(_device, _wbPipeline, nullptr);
+    if (_wbLayout) _vk->vkDestroyPipelineLayout(_device, _wbLayout, nullptr);
+    if (_wbSetLayout) _vk->vkDestroyDescriptorSetLayout(_device, _wbSetLayout, nullptr);
+    _wbSampler = VK_NULL_HANDLE;
+    _wbPool = VK_NULL_HANDLE;
+    _wbSet = VK_NULL_HANDLE;
+    _wbPipeline = VK_NULL_HANDLE;
+    _wbLayout = VK_NULL_HANDLE;
+    _wbSetLayout = VK_NULL_HANDLE;
+}
+
+// The picture into a target that can only be written as storage. The same picture the copy route
+// delivers -- the last pass at the identity placement, _placed otherwise -- only the last step is an
+// imageStore instead of a vkCmdCopyImage.
+void Chain::RecordWriteback(VkCommandBuffer cb, VkImage target, VkImageLayout externalLayout) {
+    if (!BuildWriteback()) {
+        Log("[chain] storage write-back could not be built; the target keeps the game's frame");
+        return;
+    }
+
+    const bool identity = IsIdentityPlacement();
+    if (!identity) ComposePlaced(cb);
+    Image& src = identity ? _passes.back().output[_passes.back().current] : _placed;
+    Transition(_vk, cb, src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    // Storage writes want GENERAL. gamescope keeps its output images there already, which makes
+    // this a pure barrier -- and the barrier is what orders these writes after its compositor's.
+    TransitionForeign(_vk, cb, target, externalLayout, VK_IMAGE_LAYOUT_GENERAL);
+
+    VkDescriptorImageInfo in {_wbSampler, src.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkDescriptorImageInfo out {VK_NULL_HANDLE, _storageView, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet w[2] {};
+    w[0].sType = w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w[0].dstSet = w[1].dstSet = _wbSet;
+    w[0].dstBinding = 0;
+    w[0].descriptorCount = 1;
+    w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w[0].pImageInfo = &in;
+    w[1].dstBinding = 1;
+    w[1].descriptorCount = 1;
+    w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    w[1].pImageInfo = &out;
+    _vk->vkUpdateDescriptorSets(_device, 2, w, 0, nullptr);
+
+    const IRect& t = _placement.target;
+    const int32_t rect[4] = {t.x, t.y, int32_t(t.w), int32_t(t.h)};
+    _vk->vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, _wbPipeline);
+    _vk->vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, _wbLayout, 0, 1, &_wbSet, 0,
+                                 nullptr);
+    _vk->vkCmdPushConstants(cb, _wbLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rect), rect);
+    _vk->vkCmdDispatch(cb, (t.w + 15) / 16, (t.h + 15) / 16, 1);
+
+    TransitionForeign(_vk, cb, target, VK_IMAGE_LAYOUT_GENERAL, externalLayout);
+}
+
+bool Chain::RecordReplay(VkCommandBuffer cb, VkImage swapchainImage, VkImageLayout externalLayout) {
+    // Nothing composed since the last build: there is no picture to show again, and the caller
+    // should let the game's own frame through instead.
+    if (!_usable || !_composed || _passes.empty()) return false;
+    RecordOutput(cb, swapchainImage, externalLayout);
+    return true;
 }
 
 void Chain::RequestGridProbe() { _probeArmed = true; }

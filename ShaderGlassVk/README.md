@@ -228,6 +228,9 @@ DLSS5VKLayer, which had to ship every frame to a Windows helper and wait for it 
 |---|---|
 | `SHADERGLASS=1` | Arms the layer. Without it the layer is inert in every process |
 | `SHADERGLASS_DISABLE=1` | Forces it off even when armed |
+| `SHADERGLASS_REPAINT=0` | Turns off the idle repaint, which re-composes the last frame when a setting changes while the game has stopped presenting |
+| `SHADERGLASS_GAMESCOPE` | `0` keeps the layer out of gamescope's composite. A path names a custom gamescope build whose file is not called `gamescope`, so the layer knows that process is gamescope |
+| `SHADERGLASS_GAMESCOPE_BIN` | For `shaderglass-run`: a custom gamescope build to use instead of the one on `PATH` (also `--gamescope-bin=PATH`) |
 | `SHADERGLASS_SHM` | Path to the mapping. Defaults to `/tmp/shaderglass-$UID/shm.bin` |
 | `SHADERGLASS_LOG` | Log file. Defaults to stderr |
 | `SHADERGLASS_VERBOSE=1` | Log every present |

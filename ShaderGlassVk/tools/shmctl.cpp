@@ -17,6 +17,7 @@ next.
 */
 
 #include "../common/shm_protocol.h"
+#include "../gui/launch_command.h"
 
 #include <cstdio>
 #include <cstring>
@@ -46,7 +47,8 @@ const Setting kSettings[] = {
     {"pixelsize", &ShmHeader::pixelSizeBits, true, "swapchain pixels per source pixel; 0 is Auto"},
     {"outputpolicy", &ShmHeader::outputPolicy, false,
      "0 auto, 1 stretch, 2 fit, 3 fill, 4 integer, 5 centre"},
-    {"aspect", &ShmHeader::aspectRatioBits, true, "pixel-aspect correction; 1.0 is none"},
+    {"aspect", &ShmHeader::aspectRatioBits, true,
+     "pixel height relative to width: 1.2 DOS/NTSC, 0.94 PAL, 2 double tall; 1 is none"},
     {"fliph", &ShmHeader::flipHorizontal, false, "0/1 flip horizontally"},
     {"flipv", &ShmHeader::flipVertical, false, "0/1 flip vertically"},
     {"rotation", &ShmHeader::rotation, false, "0, 1, 2, 3 -> 0, 90, 180, 270 degrees"},
@@ -74,6 +76,10 @@ void Usage() {
             "  preset <id>     select a preset by catalogue id; empty string for none\n"
             "  capture <n>     write n matched before/after frames\n"
             "  redetect        measure the source raster again from the next frame\n"
+            "  launch [game|output] [linear] [WxH] [gamescope=PATH]\n"
+            "                  print Steam launch options for gamescope from the current settings;\n"
+            "                  WxH is the screen, omitted to let gamescope choose\n"
+            "                  gamescope=PATH uses a custom gamescope build instead of PATH's\n"
             "  reset           put the settings back to their defaults, leaving status alone\n");
     fprintf(stderr, "\nsettings:\n");
     for (const auto& s : kSettings) fprintf(stderr, "  %-14s %s\n", s.name, s.help);
@@ -194,7 +200,8 @@ int main(int argc, char** argv) {
 
     const bool create = !strcmp(cmd, "set") || !strcmp(cmd, "toggle") || !strcmp(cmd, "preset") ||
                         !strcmp(cmd, "capture") || !strcmp(cmd, "reset") ||
-                        !strcmp(cmd, "settings") || !strcmp(cmd, "redetect");
+                        !strcmp(cmd, "settings") || !strcmp(cmd, "redetect") ||
+                        !strcmp(cmd, "launch");
 
     void* base = nullptr;
     int fd = -1;
@@ -220,6 +227,41 @@ int main(int argc, char** argv) {
             ShmStoreString(h->presetSeq, h->presetId, kPresetIdBytes, argv[3]);
             h->controlSeq.fetch_add(1);
             h->tuningSeq.fetch_add(1);
+        }
+    } else if (!strcmp(cmd, "launch")) {
+        // The same generator the interface's Advanced tab uses, so a line printed here and a line
+        // copied from there cannot disagree.
+        LaunchInput in;
+        in.gamescopeInstalled = true;  // the caller asked for gamescope; shaderglass-run checks
+        in.policy = h->outputPolicy.load();
+        for (int i = 3; i < argc; ++i) {
+            unsigned w = 0, hh = 0;
+            if (!strcmp(argv[i], "output")) in.where = LaunchWhere::kGamescope;
+            else if (!strcmp(argv[i], "game")) in.where = LaunchWhere::kGame;
+            else if (!strcmp(argv[i], "linear")) in.nearest = false;
+            else if (!strncmp(argv[i], "gamescope=", 10)) in.gamescopeBinary = argv[i] + 10;
+            else if (sscanf(argv[i], "%ux%u", &w, &hh) == 2) {
+                in.displayW = w;
+                in.displayH = hh;
+            } else {
+                Usage();
+                rc = 2;
+            }
+        }
+        if (rc == 0) {
+            // Without the screen's size a divisor has nothing to divide, so the game is left to
+            // choose its own resolution rather than being handed a guess.
+            if (in.displayW && in.displayH) {
+                uint32_t rw = 0, rh = 0;
+                ShmSourceExtent(h, in.displayW, in.displayH, &rw, &rh);
+                if (rw != in.displayW || rh != in.displayH) {
+                    in.renderW = rw;
+                    in.renderH = rh;
+                }
+            }
+            const LaunchCommand c = BuildLaunchCommand(in);
+            printf("%s\n", c.line.c_str());
+            fprintf(stderr, "%s\n", c.note.c_str());
         }
     } else if (!strcmp(cmd, "redetect")) {
         h->autoSourceRefresh.fetch_add(1);

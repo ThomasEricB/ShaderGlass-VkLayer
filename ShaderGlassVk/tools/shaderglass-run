@@ -1,0 +1,118 @@
+#!/bin/bash
+# ShaderGlassVk: ShaderGlass on a Vulkan layer
+# Copyright (C) 2026 Thomas Eric, bmitch87
+# GNU General Public License v3.0
+#
+# Run a program with the shader layer switched on, from a terminal or a .desktop file -- the places
+# Steam's launch options do not reach.
+#
+#   shaderglass-run [options] [--] command [args...]
+#
+#   --gamescope          run inside gamescope; the layer shades the game, gamescope scales it
+#   --gamescope=output   run inside gamescope; the layer shades gamescope's output instead, which
+#                        also covers OpenGL games (see docs/DLSS5VKLayer.md for why only one of
+#                        the two may have SHADERGLASS=1)
+#   --gamescope-bin=PATH use a custom gamescope build instead of the one on PATH; also taken from
+#                        SHADERGLASS_GAMESCOPE_BIN
+#   --linear             let gamescope scale smoothly rather than with hard pixels
+#   --preset ID          select a catalogue preset before starting
+#   -n, --dry-run        print the command instead of running it
+#
+# The gamescope line is not built here. shaderglass-ctl's `launch` prints it, from the same code the
+# interface's Advanced tab uses, so the two cannot drift apart into two slightly different answers.
+set -euo pipefail
+
+here=$(cd -- "$(dirname -- "$(readlink -f -- "$0")")" && pwd)
+ctl=""
+for c in "$here/../build/native/tools/shaderglass-ctl" "$here/shaderglass-ctl"; do
+    [ -x "$c" ] && { ctl=$c; break; }
+done
+[ -z "$ctl" ] && ctl=$(command -v shaderglass-ctl || true)
+
+shm=${SHADERGLASS_SHM:-/tmp/shaderglass-${SHADERGLASS_UID:-$(id -u)}/shm.bin}
+
+where=""
+gsbin=${SHADERGLASS_GAMESCOPE_BIN:-}
+linear=""
+preset=""
+dry=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --gamescope) where=game ;;
+        --gamescope=output) where=output ;;
+        --gamescope=game) where=game ;;
+        --gamescope-bin) shift; gsbin=${1:-} ;;
+        --gamescope-bin=*) gsbin=${1#--gamescope-bin=} ;;
+        --linear) linear=linear ;;
+        --preset) shift; preset=${1:-} ;;
+        --preset=*) preset=${1#--preset=} ;;
+        -n|--dry-run) dry=1 ;;
+        -h|--help) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --) shift; break ;;
+        -*) echo "shaderglass-run: unknown option $1" >&2; exit 2 ;;
+        *) break ;;
+    esac
+    shift
+done
+[ $# -gt 0 ] || { echo "shaderglass-run: nothing to run (see --help)" >&2; exit 2; }
+
+if [ -n "$preset" ]; then
+    [ -n "$ctl" ] || { echo "shaderglass-run: --preset needs shaderglass-ctl, which was not found" >&2; exit 1; }
+    mkdir -p "$(dirname -- "$shm")"
+    "$ctl" "$shm" preset "$preset"
+fi
+
+run() {
+    if [ $dry -eq 1 ]; then printf '%q ' "$@"; printf '\n'; exit 0; fi
+    exec "$@"
+}
+
+# Plain: the layer in the program, nothing else.
+plain() { run env SHADERGLASS=1 "$@"; }
+
+[ -z "$where" ] && plain "$@"
+
+# Asked for gamescope, but there is nothing to nest into -- or we are already inside it, on a Steam
+# Deck in game mode or in a nested session, where a second compositor would only sit inside the first.
+if [ -n "$gsbin" ]; then
+    gsbin=$(readlink -f -- "$gsbin" || true)
+    if [ -z "$gsbin" ] || [ ! -x "$gsbin" ] || [ -d "$gsbin" ]; then
+        echo "shaderglass-run: the custom gamescope was not found; running without it" >&2
+        plain "$@"
+    fi
+    # The line below is split on spaces, and a path with one would come apart.
+    case "$gsbin" in *[[:space:]]*)
+        echo "shaderglass-run: a gamescope path with spaces cannot be used here: $gsbin" >&2
+        exit 1 ;;
+    esac
+elif ! command -v gamescope >/dev/null; then
+    echo "shaderglass-run: gamescope is not installed; running without it" >&2
+    plain "$@"
+fi
+if [ -n "${GAMESCOPE_WAYLAND_DISPLAY:-}" ]; then
+    echo "shaderglass-run: already inside gamescope; not nesting another" >&2
+    plain "$@"
+fi
+[ -n "$ctl" ] || { echo "shaderglass-run: gamescope needs shaderglass-ctl, which was not found" >&2; exit 1; }
+
+# The screen gamescope should fill. xrandr answers under XWayland as well as X11; without an answer
+# gamescope picks for itself, and a divisor is left with nothing to divide, so the game chooses its
+# own resolution rather than being handed a guess.
+size=""
+if command -v xrandr >/dev/null; then
+    size=$(xrandr --current 2>/dev/null | awk '/ connected primary /{print $4; exit}' | cut -d+ -f1)
+    [ -z "$size" ] && size=$(xrandr --current 2>/dev/null | awk '/ connected [0-9]/{print $3; exit}' | cut -d+ -f1)
+fi
+
+mkdir -p "$(dirname -- "$shm")"
+line=$("$ctl" "$shm" launch "$where" $linear $size ${gsbin:+"gamescope=$gsbin"} 2>/dev/null)
+
+# The line is plain words -- no quoting inside it -- ending in %command%, which stands for the real
+# command. That one token becomes "$@", arguments intact; everything before it is handed to env, which
+# takes the leading NAME=value words as the environment and runs the rest.
+read -ra words <<< "$line"
+cmd=()
+for w in "${words[@]}"; do
+    if [ "$w" = "%command%" ]; then cmd+=("$@"); else cmd+=("$w"); fi
+done
+run env "${cmd[@]}"

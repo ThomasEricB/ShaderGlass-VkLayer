@@ -1,0 +1,34 @@
+#version 450
+/*
+ShaderGlassVk built-in write-back -- compute.
+
+Puts the composed picture into an image that cannot be copied into. gamescope's own output images are
+the case: created Sampled | Storage | TransferSrc for its compute compositor, with no TransferDst and
+no colour attachment, and those flags chose the DRM modifier the image was allocated with, so they
+are not the layer's to add to. Storage is there, so the picture goes in the way gamescope's own
+compositor puts it there -- an imageStore.
+
+`dst` is declared exactly as gamescope declares its composite target (descriptor_set.h, binding 1,
+rgba8, writeonly), and is written through the very view gamescope itself bound, so this write is
+valid on precisely the formats gamescope's own writes are. Coordinates are shared: the source is
+swapchain-sized, and only the target rectangle is written.
+*/
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(set = 0, binding = 1, rgba8) writeonly uniform image2D dst;
+
+layout(push_constant) uniform Rect
+{
+    ivec2 offset;  // the target rectangle, in pixels of both images
+    ivec2 size;
+} rect;
+
+void main()
+{
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= rect.size.x || p.y >= rect.size.y) return;
+    const ivec2 at = p + rect.offset;
+    imageStore(dst, at, texelFetch(src, at, 0));
+}
