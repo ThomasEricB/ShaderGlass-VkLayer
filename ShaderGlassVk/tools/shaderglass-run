@@ -58,7 +58,9 @@ done
 
 if [ -n "$preset" ]; then
     [ -n "$ctl" ] || { echo "shaderglass-run: --preset needs shaderglass-ctl, which was not found" >&2; exit 1; }
-    mkdir -p "$(dirname -- "$shm")"
+    # umask 077: the layer refuses a runtime directory that grants anything to group or
+    # other, and plain mkdir would leave it 0755 wherever the umask is the usual 022.
+    (umask 077; mkdir -p "$(dirname -- "$shm")")
     "$ctl" "$shm" preset "$preset"
 fi
 
@@ -104,7 +106,7 @@ if command -v xrandr >/dev/null; then
     [ -z "$size" ] && size=$(xrandr --current 2>/dev/null | awk '/ connected [0-9]/{print $3; exit}' | cut -d+ -f1)
 fi
 
-mkdir -p "$(dirname -- "$shm")"
+(umask 077; mkdir -p "$(dirname -- "$shm")")
 line=$("$ctl" "$shm" launch "$where" $linear $size ${gsbin:+"gamescope=$gsbin"} 2>/dev/null)
 
 # The line is plain words -- no quoting inside it -- ending in %command%, which stands for the real

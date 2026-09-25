@@ -196,7 +196,13 @@ void MainWindow::closeEvent(QCloseEvent* event) {
 // The interface creates the mapping if it is not there yet, so settings can be chosen before a game
 // is started; the layer does the same from its side, and whichever gets there first initialises it.
 bool MainWindow::AttachShm() {
-    QDir().mkpath(QFileInfo(_shmPath).absolutePath());
+    // 0700, not whatever the umask leaves: the layer refuses a runtime directory that grants
+    // anything to group or other, and QDir::mkpath() would create it 0755 on most systems --
+    // which made the layer refuse the very mapping this interface had just created. The chmod
+    // also repairs a directory an older build left too permissive.
+    const QString shmDir = QFileInfo(_shmPath).absolutePath();
+    QDir().mkpath(shmDir);
+    ::chmod(shmDir.toUtf8().constData(), 0700);
 
     // ::open and ::close, because QWidget has a close() of its own that would win here.
     const int fd = ::open(_shmPath.toUtf8().constData(), O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
