@@ -3,7 +3,10 @@ layer_sources = files(
   'src/chain.cpp',
   'src/catalogue.cpp',
   'src/semantics.cpp',
+  'src/pixel_grid.cpp',
+  'src/chain_order.cpp',
   'src/texture.cpp',
+  'src/crash_trace.cpp',
 )
 
 layer_args = []

@@ -11,6 +11,11 @@
 #   tools/build-catalogue.sh                      # clone into build/slang-shaders, then build
 #   tools/build-catalogue.sh /path/to/slang-shaders
 #
+# Both architectures are built. A shared object has one, and a 32-bit game cannot load a 64-bit
+# catalogue -- GoldSrc, Source and a good share of what CRT shaders are wanted for are 32-bit, so
+# the 32-bit catalogue is part of "everything" rather than an extra, exactly as the 32-bit layer is.
+# SHADERGLASS_SKIP_32=1 leaves it out when there is no 32-bit toolchain.
+#
 # Environment:
 #   SHADERGLASS_BUILD_ROOT   where build output goes (default: build)
 #   SHADERGLASS_GEN          the generator to use (default: $BUILD_ROOT/native/gen/shaderglass-gen)
@@ -73,8 +78,22 @@ echo "compiling $OUT/cm"
 cmake -S "$OUT" -B "$OUT/cm" -G Ninja -DCMAKE_BUILD_TYPE=Release >/dev/null
 cmake --build "$OUT/cm" -j
 
+built32=""
+if [ "${SHADERGLASS_SKIP_32:-0}" = "1" ]; then
+    echo "skipping the 32-bit catalogue (SHADERGLASS_SKIP_32=1)"
+elif ! echo 'int main(void){return 0;}' | cc -m32 -x c - -o /dev/null 2>/dev/null; then
+    echo "no 32-bit toolchain: skipping the 32-bit catalogue" >&2
+    echo "  a 32-bit game will fall back to passing frames through" >&2
+else
+    echo "compiling $OUT/cm32 (32-bit)"
+    cmake -S "$OUT" -B "$OUT/cm32" -G Ninja -DCMAKE_BUILD_TYPE=Release -DSG_PRESETS_32=ON >/dev/null
+    cmake --build "$OUT/cm32" -j
+    built32="$OUT/cm32/libShaderGlassPresets_32.so"
+fi
+
 echo
 echo "built: $OUT/cm/libShaderGlassPresets.so"
+[ -n "$built32" ] && echo "       $built32"
 if [ "$gen_status" -ne 0 ]; then
     echo "(some presets did not compile -- see the FAIL lines above; over the full libretro tree"
     echo " these are references that are dangling upstream)"

@@ -71,6 +71,8 @@ class MainWindow : public QWidget {
     QCheckBox* _paused = nullptr;
     QComboBox* _profiles = nullptr;
     QLabel* _status = nullptr;
+    QLabel* _notice = nullptr;
+    QLabel* _autoSourceLabel = nullptr;
     QLabel* _presetLabel = nullptr;
     QTimer* _timer = nullptr;
 
@@ -78,4 +80,11 @@ class MainWindow : public QWidget {
     bool _captureVisible = false;
     uint32_t _lastHeartbeat = 0;
     int _idleTicks = 0;
+
+    // The notice shown when a game stops presenting through Vulkan without exiting. Probing costs a
+    // /proc read, so it happens once per silent game rather than twice a second, and the pid it was
+    // answered for is kept so the next game gets its own answer.
+    void UpdateNotice(bool stale, const QString& game);
+    void RequestSourceRefresh();
+    uint32_t _noticePid = 0;
 };

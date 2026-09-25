@@ -321,7 +321,20 @@ void EmitBuildFiles(const fs::path& out, const std::vector<std::string>& files) 
         c << "  sg_index.cpp\n";
         c << ")\n";
         c << "target_include_directories(ShaderGlassPresets PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})\n";
-        c << "set_target_properties(ShaderGlassPresets PROPERTIES PREFIX \"lib\")\n";
+        c << "set_target_properties(ShaderGlassPresets PROPERTIES PREFIX \"lib\")\n\n";
+
+        // A shared object has an architecture, and a 32-bit game cannot load a 64-bit catalogue.
+        // The two are named apart for the same reason the layers are, so both can sit in one
+        // directory and each layer finds its own.
+        c << "# -DSG_PRESETS_32=ON builds the catalogue a 32-bit game needs, under the name its\n";
+        c << "# layer looks for. The generated sources are the same either way.\n";
+        c << "option(SG_PRESETS_32 \"Build the 32-bit catalogue\" OFF)\n";
+        c << "if(SG_PRESETS_32)\n";
+        c << "  set_target_properties(ShaderGlassPresets PROPERTIES OUTPUT_NAME "
+             "\"ShaderGlassPresets_32\")\n";
+        c << "  target_compile_options(ShaderGlassPresets PRIVATE -m32)\n";
+        c << "  target_link_options(ShaderGlassPresets PRIVATE -m32)\n";
+        c << "endif()\n";
     }
 }
 

@@ -33,6 +33,7 @@ restarts it past whatever killed it, so one such preset does not hide the rest.
 
 #include "../layer/src/catalogue.h"
 #include "../layer/src/chain.h"
+#include "../layer/src/pixel_grid.h"
 #include "../layer/src/vk_table.h"
 
 #include <dlfcn.h>
@@ -327,7 +328,7 @@ void WritePpm(const char* path, const uint8_t* bgra, uint32_t w, uint32_t h) {
 
 int RunRange(const std::vector<std::string>& ids, size_t from, uint32_t width, uint32_t height,
              bool verbose, int progress, size_t* built, size_t* failed,
-             const std::string& dumpDir, bool stats) {
+             const std::string& dumpDir, bool stats, bool probe) {
     Device d;
     if (!CreateDevice(d)) return 2;
 
@@ -350,7 +351,8 @@ int RunRange(const std::vector<std::string>& ids, size_t from, uint32_t width, u
     // result back out. Only needed when dumping.
     // Both --dump and --stats need a real picture going in: measuring what a chain does to an
     // image it was never given is measuring nothing, and every pass dutifully reports black.
-    const bool wantPattern = !dumpDir.empty() || stats;
+    // The detector needs a real picture too -- there is no grid in an image nobody drew.
+    const bool wantPattern = !dumpDir.empty() || stats || probe;
 
     HostBuffer scratch {};
     const VkDeviceSize imageBytes = VkDeviceSize(width) * height * 4;
@@ -439,6 +441,12 @@ int RunRange(const std::vector<std::string>& ids, size_t from, uint32_t width, u
                     break;
                 }
 
+                // The source detector's readback, exercised on a real device. It packs a couple
+                // of hundred copy regions out of the frame image and reads them back on the host,
+                // and none of that is reachable from the pure unit test -- so without this the
+                // first thing to run it is a game.
+                if (probe) chain.RequestGridProbe();
+
                 ok = chain.Record(d.cb, external.image, frame, VK_IMAGE_LAYOUT_GENERAL);
                 d.deviceTable.vkEndCommandBuffer(d.cb);
                 if (!ok) {
@@ -460,6 +468,14 @@ int RunRange(const std::vector<std::string>& ids, size_t from, uint32_t width, u
                 d.deviceTable.vkWaitForFences(d.device, 1, &d.fence, VK_TRUE, UINT64_MAX);
                 d.deviceTable.vkResetFences(d.device, 1, &d.fence);
                 chain.FrameCompleted();
+
+                if (probe) {
+                    GridEstimate g {};
+                    if (chain.TakeGridEstimate(&g))
+                        std::printf("  probe %-40s %s x%.2f y%.2f conf %.2f\n", id.c_str(),
+                                    g.Valid() ? "measured" : "no grid ", double(g.scaleX),
+                                    double(g.scaleY), double(g.confidence));
+                }
             }
 
             // Per-pass statistics, which is what tells you where a chain went wrong. A signal
@@ -610,7 +626,7 @@ int RunRange(const std::vector<std::string>& ids, size_t from, uint32_t width, u
 
 int main(int argc, char** argv) {
     uint32_t width = 640, height = 480, stride = 1, limit = 0;
-    bool verbose = false, isolate = false, stats = false;
+    bool verbose = false, isolate = false, stats = false, probe = false;
     std::string dumpDir;
     std::vector<std::string> only;
 
@@ -624,6 +640,7 @@ int main(int argc, char** argv) {
         else if (arg == "--isolate") isolate = true;
         else if (arg == "--dump" && i + 1 < argc) dumpDir = argv[++i];
         else if (arg == "--stats") stats = true;
+        else if (arg == "--probe") probe = true;
         else only.push_back(arg);
     }
     if (!stride) stride = 1;
@@ -654,7 +671,7 @@ int main(int argc, char** argv) {
 
     if (!isolate) {
         const int rc =
-            RunRange(ids, 0, width, height, verbose, -1, &built, &failed, dumpDir, stats);
+            RunRange(ids, 0, width, height, verbose, -1, &built, &failed, dumpDir, stats, probe);
         if (rc) return rc;
         std::printf("\n%zu built and recorded, %zu failed\n", built, failed);
         return failed ? 1 : 0;
@@ -681,7 +698,7 @@ int main(int argc, char** argv) {
             size_t childBuilt = 0, childFailed = 0;
             const int rc =
                 RunRange(ids, next, width, height, verbose, fds[1], &childBuilt,
-                         &childFailed, dumpDir, stats);
+                         &childFailed, dumpDir, stats, probe);
             // Counts travel back through the pipe's last two words rather than a second channel.
             const size_t tally[2] = {childBuilt, childFailed};
             ssize_t ignored = write(fds[1], tally, sizeof(tally));

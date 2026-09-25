@@ -56,6 +56,10 @@ const Setting kSettings[] = {
     {"cropwidth", &ShmHeader::cropWidth, false, "crop width, in swapchain pixels"},
     {"cropheight", &ShmHeader::cropHeight, false, "crop height, in swapchain pixels"},
     {"frameskip", &ShmHeader::frameSkip, false, "run the chain every Nth frame; 0 and 1 mean every"},
+    {"autosource", &ShmHeader::autoSourceEnabled, false,
+     "0/1 measure the game's own raster and use it instead of the source mode"},
+    {"autosourcems", &ShmHeader::autoSourceIntervalMs, false,
+     "milliseconds between measurements; 0 means the default"},
 };
 
 void Usage() {
@@ -69,6 +73,7 @@ void Usage() {
             "  toggle <key>    flip a setting between 0 and 1\n"
             "  preset <id>     select a preset by catalogue id; empty string for none\n"
             "  capture <n>     write n matched before/after frames\n"
+            "  redetect        measure the source raster again from the next frame\n"
             "  reset           put the settings back to their defaults, leaving status alone\n");
     fprintf(stderr, "\nsettings:\n");
     for (const auto& s : kSettings) fprintf(stderr, "  %-14s %s\n", s.name, s.help);
@@ -159,6 +164,15 @@ void PrintStatus(const ShmHeader* h) {
     printf("source=%ux%u\n", h->sourceActualWidth.load(), h->sourceActualHeight.load());
     printf("output=%ux%u\n", h->outputActualWidth.load(), h->outputActualHeight.load());
     printf("passes=%u\n", h->passCount.load());
+    if (h->autoSourceEnabled.load()) {
+        const uint32_t aw = h->autoSourceWidth.load(), ah = h->autoSourceHeight.load();
+        if (aw && ah)
+            printf("auto_source=%ux%u x%.2f y%.2f confidence=%.2f\n", aw, ah,
+                   double(BitsToFloat(h->autoSourceScaleXBits.load())),
+                   double(BitsToFloat(h->autoSourceScaleYBits.load())),
+                   double(BitsToFloat(h->autoSourceConfidenceBits.load())));
+        else printf("auto_source=measuring\n");
+    }
     printf("fps=%.1f\n", double(BitsToFloat(h->fpsBits.load())));
     printf("preset=%s\n", ShmPresetId(h).c_str());
 
@@ -179,7 +193,8 @@ int main(int argc, char** argv) {
     const char* cmd = argv[2];
 
     const bool create = !strcmp(cmd, "set") || !strcmp(cmd, "toggle") || !strcmp(cmd, "preset") ||
-                        !strcmp(cmd, "capture") || !strcmp(cmd, "reset") || !strcmp(cmd, "settings");
+                        !strcmp(cmd, "capture") || !strcmp(cmd, "reset") ||
+                        !strcmp(cmd, "settings") || !strcmp(cmd, "redetect");
 
     void* base = nullptr;
     int fd = -1;
@@ -206,6 +221,9 @@ int main(int argc, char** argv) {
             h->controlSeq.fetch_add(1);
             h->tuningSeq.fetch_add(1);
         }
+    } else if (!strcmp(cmd, "redetect")) {
+        h->autoSourceRefresh.fetch_add(1);
+        h->controlSeq.fetch_add(1);
     } else if (!strcmp(cmd, "capture")) {
         if (argc != 4) {
             Usage();

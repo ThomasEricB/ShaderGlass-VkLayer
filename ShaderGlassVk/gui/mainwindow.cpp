@@ -7,6 +7,7 @@ GNU General Public License v3.0
 #include "mainwindow.h"
 
 #include "capture_view.h"
+#include "game_probe.h"
 #include "param_panel.h"
 #include "preset_tree.h"
 #include "shm_binder.h"
@@ -121,6 +122,18 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     _status->setTextFormat(Qt::PlainText);
     outer->addWidget(_status);
 
+    // Hidden until there is something to say. It carries launch options the user is meant to copy,
+    // so the text is selectable and the label wraps rather than widening the window.
+    _notice = new QLabel(this);
+    _notice->setTextFormat(Qt::RichText);
+    _notice->setWordWrap(true);
+    _notice->setTextInteractionFlags(Qt::TextBrowserInteraction);
+    _notice->setOpenExternalLinks(true);
+    _notice->setStyleSheet(QStringLiteral("QLabel { border: 1px solid palette(mid);"
+                                          " border-radius: 4px; padding: 6px; }"));
+    _notice->hide();
+    outer->addWidget(_notice);
+
     // --- wiring ---------------------------------------------------------------------------------
     if (_hdr) {
         _enabled->setChecked(ShmEnabled(_hdr));
@@ -187,7 +200,18 @@ bool MainWindow::AttachShm() {
 
     _shmBase = base;
     _hdr = static_cast<ShmHeader*>(base);
-    ShmInitDefaults(_hdr);
+
+    // Only when there is nothing usable there. ShmInitDefaults memsets the whole header -- every
+    // setting, the chosen preset, and the layer's status with them -- so calling it unconditionally
+    // means opening the interface wipes the state of a game that is already running. It did: the
+    // game then read an empty preset on every frame and composed nothing, which looks exactly like
+    // an interface whose preset list does not work.
+    //
+    // Same test the layer uses, for the same reason: a mapping left by an older build has a
+    // different magic or version, and re-initialising is the only safe reading of either.
+    if (_hdr->magic.load() != kShmMagic || _hdr->version.load() != kShmVersion)
+        ShmInitDefaults(_hdr);
+
     return true;
 }
 
@@ -253,6 +277,35 @@ QWidget* MainWindow::BuildInputTab() {
     _binder->AddInt(form, "sourceheight", tr("Source height"), &ShmHeader::sourceHeight, 0, 16384,
                     tr("For the Classic raster and Custom modes."), ShmBinder::AtBuild);
 
+    auto* autoBox = _binder->AddBool(form, "autosource", tr("Detect automatically"),
+                     &ShmHeader::autoSourceEnabled,
+                     tr("Measure the game's own raster out of the frame and use that, instead of "
+                        "the mode above.\n"
+                        "A pixel-art game upscaled by a fraction -- 320x224 stretched to fill a "
+                        "2562x1082 window is x8.01 across and x4.83 down -- has no divisor on the "
+                        "list that fits it, and the nearest integer is not a near miss but a "
+                        "different grid. Measuring finds the fractional answer.\n"
+                        "Re-measured every few seconds, so a game that changes resolution is "
+                        "followed."),
+                     ShmBinder::AtBuild);
+
+    // Turning it on means "measure what is on screen now". Without this the layer would put back
+    // whatever it measured for an earlier scene, which is what made the toggle feel inert.
+    connect(autoBox, &QCheckBox::toggled, this, [this](bool) { RequestSourceRefresh(); });
+
+    auto* redetect = new QPushButton(tr("Measure again now"), page);
+    redetect->setToolTip(FormatTip(tr("Take a fresh measurement of the frame on screen.\n"
+                                      "It is measured again every couple of seconds anyway; this "
+                                      "is for when the scene has just changed and waiting is "
+                                      "tiresome.")));
+    connect(redetect, &QPushButton::clicked, this, [this] { RequestSourceRefresh(); });
+    form->addRow(QString(), redetect);
+
+    _autoSourceLabel = new QLabel(page);
+    _autoSourceLabel->setWordWrap(true);
+    _autoSourceLabel->setEnabled(false);
+    form->addRow(QString(), _autoSourceLabel);
+
     auto* note = new QLabel(
         tr("Pixel size, output policy, aspect, crop and frame skip arrive with the layer code that "
            "honours them."),
@@ -262,6 +315,15 @@ QWidget* MainWindow::BuildInputTab() {
     form->addRow(note);
 
     return page;
+}
+
+// Ask the layer to throw away what it measured and measure again. A counter rather than a flag: a
+// flag would need clearing by whoever read it, and two presses before the next frame would be one
+// request.
+void MainWindow::RequestSourceRefresh() {
+    if (!_hdr) return;
+    _hdr->autoSourceRefresh.fetch_add(1, std::memory_order_release);
+    _hdr->controlSeq.fetch_add(1, std::memory_order_release);
 }
 
 void MainWindow::ChoosePreset(const QString& id) {
@@ -332,13 +394,92 @@ void MainWindow::UpdateStatus() {
         if (fps > 0.0f) text += tr("  ·  %1 fps").arg(double(fps), 0, 'f', 1);
     }
 
-    const QString reason = QString::fromStdString(
-        ShmLoadString(_hdr->layerReasonSeq, _hdr->layerReason, kReasonBytes));
-    if (!reason.isEmpty()) text += tr("  ·  %1").arg(reason);
+    // Only while the layer is actually writing. The reason is the last thing a layer said, and a
+    // layer that has gone away leaves its last words behind -- showing them beside "not running"
+    // reads as a live diagnosis of a game that is no longer being watched, which is worse than
+    // saying nothing.
+    if (!stale) {
+        const QString reason = QString::fromStdString(
+            ShmLoadString(_hdr->layerReasonSeq, _hdr->layerReason, kReasonBytes));
+        if (!reason.isEmpty()) text += tr("  ·  %1").arg(reason);
+    }
 
     _status->setText(text);
+    UpdateNotice(stale, game);
+
+    if (_autoSourceLabel) {
+        if (!_hdr->autoSourceEnabled.load(std::memory_order_relaxed)) {
+            _autoSourceLabel->clear();
+        } else {
+            const uint32_t aw = _hdr->autoSourceWidth.load(std::memory_order_relaxed);
+            const uint32_t ah = _hdr->autoSourceHeight.load(std::memory_order_relaxed);
+            if (!aw || !ah) {
+                _autoSourceLabel->setText(
+                    stale ? tr("Nothing measured: no game is running.")
+                          : tr("Measuring\u2026 nothing found yet. A frame with no pixel grid "
+                               "\u2014 a movie, a 3D scene, a blank menu \u2014 is left alone."));
+            } else {
+                _autoSourceLabel->setText(
+                    tr("Measured %1\u00d7%2, from \u00d7%3 across and \u00d7%4 down "
+                       "(confidence %5).")
+                        .arg(aw)
+                        .arg(ah)
+                        .arg(double(ShmBitsFloat(
+                                 _hdr->autoSourceScaleXBits.load(std::memory_order_relaxed))),
+                             0, 'f', 2)
+                        .arg(double(ShmBitsFloat(
+                                 _hdr->autoSourceScaleYBits.load(std::memory_order_relaxed))),
+                             0, 'f', 2)
+                        .arg(double(ShmBitsFloat(
+                                 _hdr->autoSourceConfidenceBits.load(std::memory_order_relaxed))),
+                             0, 'f', 2));
+            }
+        }
+    }
 
     if (_captureVisible && _capture) _capture->Refresh(QString::fromStdString(ShmCaptureDir()));
+}
+
+// A game that stops presenting looks exactly like a game that exited, from the mapping alone. It is
+// worth telling the two apart: the second is nothing to report, and the first is usually a game
+// that has handed the screen to OpenGL, which the layer cannot see but Zink can hand back.
+void MainWindow::UpdateNotice(bool stale, const QString& game) {
+    if (!stale) {
+        _noticePid = 0;
+        _notice->hide();
+        return;
+    }
+
+    const uint32_t pid = _hdr->layerPid.load(std::memory_order_relaxed);
+    if (!pid || !ProcessAlive(pid)) {  // the ordinary end of a game
+        _noticePid = 0;
+        _notice->hide();
+        return;
+    }
+    if (pid == _noticePid) return;  // already answered for this game
+    _noticePid = pid;
+
+    const RenderApis apis = ProbeRenderApis(pid);
+    const QString who = game.isEmpty() ? tr("The game") : game;
+
+    if (apis.RendersWithOpenGL()) {
+        _notice->setText(
+            tr("<b>%1 is rendering with OpenGL.</b><br>"
+               "ShaderGlass only sees Vulkan frames, so it cannot shade this game as it stands "
+               "&mdash; which is why the effect stops once the game leaves its Vulkan intro.<br><br>"
+               "Zink routes OpenGL through Vulkan. Put this in front of "
+               "<code>%%command%%</code> in the launch options:<br>"
+               "<code>%2</code><br><br>"
+               "Running the game inside gamescope works too, and shades its composited output "
+               "whatever the game renders with.")
+                .arg(who.toHtmlEscaped(), QString::fromStdString(ZinkLaunchOptions())));
+    } else {
+        _notice->setText(tr("<b>%1 has stopped presenting through Vulkan.</b><br>"
+                            "It is still running, so the effect will come back on its own if the "
+                            "game is only minimised or paused.")
+                            .arg(who.toHtmlEscaped()));
+    }
+    _notice->show();
 }
 
 // --- configuration and profiles ---------------------------------------------------------------

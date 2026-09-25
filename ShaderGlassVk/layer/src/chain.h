@@ -31,6 +31,7 @@ Every failure is fail-open: a chain that cannot be built leaves the game's own f
 
 #include "../../common/shm_protocol.h"
 #include "../../presets/preset_api.h"
+#include "pixel_grid.h"
 #include "semantics.h"
 #include "texture.h"
 #include "vk_util.h"
@@ -54,6 +55,12 @@ class Chain {
 
     // Why not, when not. Empty while it is working.
     const char* Reason() const { return _reason.c_str(); }
+
+    // Something the user should be told about a chain that is otherwise running -- a preset that
+    // was named but could not be loaded, so the frame is going through untouched. Distinct from
+    // Reason(), which means the chain cannot run at all. Empty when there is nothing to say, so
+    // publishing it every frame also clears it once the cause is fixed.
+    const char* Notice() const { return _notice.c_str(); }
 
     // Build or rebuild for this swapchain, this source raster and this preset. Cheap and a no-op
     // when nothing has changed, so it is safe to call every present.
@@ -87,6 +94,14 @@ class Chain {
     // here renders a preview (decision 8), because a second render in another process would be a
     // different frame at a different raster and would prove nothing about this one.
     void RequestCapture();
+
+    // Ask for one measurement of the game's own raster out of the next recorded frame. The answer
+    // arrives after that frame's FrameCompleted, and is read with TakeGridEstimate.
+    void RequestGridProbe();
+
+    // The last measurement, once. Returns false until a probe has completed, and false again for
+    // every call after the first, so a caller cannot act twice on one measurement.
+    bool TakeGridEstimate(GridEstimate* out);
 
     uint32_t PassCount() const { return uint32_t(_passes.size()); }
 
@@ -228,6 +243,7 @@ class Chain {
 
     bool _usable = false;
     std::string _reason;
+    std::string _notice;
 
     uint32_t _swapWidth = 0, _swapHeight = 0;
     uint32_t _sourceWidth = 0, _sourceHeight = 0;
@@ -305,6 +321,21 @@ class Chain {
     uint64_t _captureSerial = 0;
 
     void WriteCapture();
+
+    // Only allocated once the source detector is switched on. Two packed strips -- scanlines across
+    // the frame for the horizontal period, columns down it for the vertical -- rather than the whole
+    // frame, which at a 4K swapchain would be 33 MB of readback and 8 million texel conversions on
+    // the game's own thread every few seconds.
+    HostBuffer _probe {};
+    VkDeviceSize _probeBytes = 0;
+    uint32_t _probeLines = 0;      // scanlines sampled per axis
+    VkDeviceSize _probeColOffset = 0;  // where the column strip starts
+    bool _probeArmed = false;
+    bool _probePending = false;
+    bool _probeReady = false;
+    GridEstimate _probeResult {};
+
+    void ReadGridProbe();
 
     // Only allocated when the self-test is asked for.
     HostBuffer _selfTest {};

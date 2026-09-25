@@ -41,7 +41,12 @@ static constexpr uint32_t kShmMagic = 0x314C4753;
 // Bumped whenever the layout below changes. A mapping of any other version is re-initialised rather
 // than half-read: a field inserted anywhere but the end moves everything after it, and a build that
 // has not caught up then reads its neighbour's value.
-static constexpr uint32_t kShmVersion = 1;
+static constexpr uint32_t kShmVersion = 3;
+
+// How often the source detector re-measures, when it is on. Long enough that the readback and the
+// analysis are lost in the noise of a frame, short enough to catch a game changing its raster at a
+// scene or resolution change.
+static constexpr uint32_t kAutoSourceDefaultMs = 2000;
 
 // The whole mapping. No pixel regions -- see the file comment.
 static constexpr size_t kHeaderBytes = 65536;
@@ -259,6 +264,33 @@ struct ShmHeader {
     // would move all of them.
     std::atomic<uint32_t> paramCount;
     ShmParam params[kMaxParams];
+
+    // --- source auto-detection ----------------------------------------------------------------
+    // After params for the reason params came after everything else: every offset above is pinned by
+    // a static_assert, and appending here moves none of them.
+    //
+    // A pixel-art game upscaled by a fraction cannot be expressed by the x2..x8 divisor list, and
+    // guessing the nearest integer is worse than not guessing. When this is on, the layer measures
+    // the game's own raster out of the frame and uses that instead. See layer/src/pixel_grid.h.
+    std::atomic<uint32_t> autoSourceEnabled;     // 0/1
+    std::atomic<uint32_t> autoSourceIntervalMs;  // between measurements; 0 means kAutoSourceDefaultMs
+
+    // Written by the layer, read by the interface: what the last measurement found. Width and height
+    // are zero until something has been measured, which is also how "on but nothing found yet" is
+    // told apart from "found a raster".
+    std::atomic<uint32_t> autoSourceWidth;
+    std::atomic<uint32_t> autoSourceHeight;
+    std::atomic<uint32_t> autoSourceScaleXBits;      // float: swapchain pixels per source pixel
+    std::atomic<uint32_t> autoSourceScaleYBits;      // float
+    std::atomic<uint32_t> autoSourceConfidenceBits;  // float 0..1
+    std::atomic<uint32_t> autoSourceSeq;             // bumped on each new measurement
+
+    // Bumped by the interface to demand a fresh measurement: on the toggle changing, and on the
+    // button. A request rather than the layer inferring an edge, because the layer cannot see one it
+    // was not running for -- a toggle flipped while no game is attached, or flipped twice between
+    // two of its frames, leaves no edge behind, and the user who pressed it is still owed a new
+    // measurement. The layer keeps the last value it acted on and compares.
+    std::atomic<uint32_t> autoSourceRefresh;
 };
 
 static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region");
@@ -269,7 +301,7 @@ static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region")
 // from the same header. If these fire, the layout changed: bump kShmVersion in the same commit, then
 // update these numbers.
 // Verified identical in the 64-bit and 32-bit builds, which both attach to the same file.
-static_assert(sizeof(ShmHeader) == 9448, "the header layout changed -- bump kShmVersion");
+static_assert(sizeof(ShmHeader) == 9484, "the header layout changed -- bump kShmVersion");
 static_assert(sizeof(ShmParam) == 68, "the parameter block changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, enabled) == 16, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, sourceMode) == 284, "layout changed -- bump kShmVersion");
@@ -331,6 +363,10 @@ inline void ShmInitDefaults(ShmHeader* h) {
     h->aspectRatioBits.store(FloatToBits(1.0f));
     h->rotation.store(kRotate0);
     h->frameSkip.store(0);
+    // Off by default. A layer that silently changed a game's source raster because it thought it saw
+    // a pixel grid would be the same kind of hostile as one that applied a filter unasked.
+    h->autoSourceEnabled.store(0);
+    h->autoSourceIntervalMs.store(0);  // 0 means kAutoSourceDefaultMs
     h->layerState.store(kLayerDetached);
 }
 
@@ -394,6 +430,18 @@ inline std::string ShmPresetId(const ShmHeader* h) {
 inline void ShmSourceExtent(const ShmHeader* h, uint32_t swapW, uint32_t swapH,
                             uint32_t* outW, uint32_t* outH) {
     uint32_t w = swapW, hgt = swapH;
+    // The detector wins over the mode rather than being a mode of its own, so turning it off puts
+    // the user's own choice back rather than leaving them on a raster nobody picked.
+    if (h && h->autoSourceEnabled.load()) {
+        const uint32_t aw = h->autoSourceWidth.load();
+        const uint32_t ah = h->autoSourceHeight.load();
+        if (aw && ah) {
+            *outW = aw < kMinW ? kMinW : (aw > kMaxW ? kMaxW : aw);
+            *outH = ah < kMinH ? kMinH : (ah > kMaxH ? kMaxH : ah);
+            return;
+        }
+        // On, but nothing measured yet: fall through to the mode until there is an answer.
+    }
     if (h) {
         switch (h->sourceMode.load()) {
             case kSourceDivisor: {

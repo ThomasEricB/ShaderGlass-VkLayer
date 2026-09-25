@@ -11,6 +11,10 @@
 cmake_minimum_required(VERSION 3.16)
 project(shaderglassvk VERSION 0.1.0 LANGUAGES CXX)
 
+# Without this every add_test() below registers nothing, and ctest reports "No tests were found"
+# while the test binaries sit built and unrun -- which is how it was until this line.
+enable_testing()
+
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(FATAL_ERROR "ShaderGlassVk targets Linux; the Windows app is the tree beside this one")
 endif()
@@ -50,7 +54,10 @@ add_library(${SG_LAYER_NAME} SHARED
   layer/src/chain.cpp
   layer/src/catalogue.cpp
   layer/src/semantics.cpp
-  layer/src/texture.cpp)
+  layer/src/texture.cpp
+  layer/src/crash_trace.cpp
+  layer/src/pixel_grid.cpp
+  layer/src/chain_order.cpp)
 
 target_include_directories(${SG_LAYER_NAME} PRIVATE layer/src common presets ${SG_VULKAN_INCLUDE})
 target_link_libraries(${SG_LAYER_NAME} PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
@@ -141,6 +148,11 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
   add_executable(spirv_edit_test tests/spirv_edit_test.cpp gen/spirv_edit.cpp)
   add_test(NAME spirv_edit COMMAND spirv_edit_test)
 
+  # The source-raster detector, on frames whose answer is known.
+  add_executable(pixel_grid_test tests/pixel_grid_test.cpp layer/src/pixel_grid.cpp)
+  target_include_directories(pixel_grid_test PRIVATE layer/src)
+  add_test(NAME pixel_grid COMMAND pixel_grid_test)
+
   # --- the interface -----------------------------------------------------------
   # Optional: a build with no Qt still produces the layer, the generator and the control tool,
   # which is everything a headless or packaging build needs.
@@ -154,6 +166,7 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
       gui/param_panel.cpp
       gui/capture_view.cpp
       gui/shm_binder.cpp
+      gui/game_probe.cpp
       # The catalogue loader is the layer's own, so the interface and the layer can never disagree
       # about what a catalogue contains or which ABI they accept.
       layer/src/catalogue.cpp)

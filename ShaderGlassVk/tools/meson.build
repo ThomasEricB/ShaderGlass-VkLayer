@@ -24,7 +24,8 @@ test('semantics', semantics_test)
 # validation layer; see tests/chain_test.cpp.
 executable('chain_test',
   ['../tests/chain_test.cpp', '../layer/src/chain.cpp', '../layer/src/catalogue.cpp',
-   '../layer/src/semantics.cpp', '../layer/src/texture.cpp'],
+   '../layer/src/semantics.cpp', '../layer/src/texture.cpp',
+   '../layer/src/pixel_grid.cpp'],
   include_directories: include_directories('../layer/src', '../common', '../presets'),
   cpp_args: layer_args,
   dependencies: [vulkan_dep, cpp.find_library('dl', required: false)],
@@ -37,3 +38,11 @@ spirv_edit_test = executable('spirv_edit_test',
   install: false,
 )
 test('spirv_edit', spirv_edit_test)
+
+# The source-raster detector, on frames whose answer is known: see tests/pixel_grid_test.cpp.
+pixel_grid_test = executable('pixel_grid_test',
+  ['../tests/pixel_grid_test.cpp', '../layer/src/pixel_grid.cpp'],
+  include_directories: include_directories('..', '../layer/src'),
+  install: false,
+)
+test('pixel_grid', pixel_grid_test)

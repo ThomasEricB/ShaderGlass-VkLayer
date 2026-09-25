@@ -950,8 +950,19 @@ bool Chain::Prepare(uint32_t swapWidth, uint32_t swapHeight, VkFormat swapFormat
     // A named preset that is not in the catalogue is not a reason to stop: the chain falls back to
     // the passthrough, which is what "no preset" looks like anyway.
     _preset = Catalogue::Instance().Find(presetId);
-    if (!presetId.empty() && !_preset)
-        Log("[chain] preset '%s' is not in the catalogue; passing frames through", presetId.c_str());
+    _notice.clear();
+    if (!presetId.empty() && !_preset) {
+        // Not fatal -- the frame still reaches the screen -- but it looks exactly like a shader
+        // that does nothing, so say which of the two it is. Catalogue::Reason() carries the dlopen
+        // error when the library is what is missing.
+        Catalogue& catalogue = Catalogue::Instance();
+        _notice = "preset '" + presetId + "' did not load";
+        if (!catalogue.Usable() && catalogue.Reason()[0])
+            _notice += std::string(": ") + catalogue.Reason();
+        else
+            _notice += ": not in the catalogue";
+        Log("[chain] %s; passing frames through", _notice.c_str());
+    }
 
     const VkImageUsageFlags sampled = VK_IMAGE_USAGE_SAMPLED_BIT;
     const VkImageUsageFlags src = VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
@@ -1582,6 +1593,55 @@ bool Chain::Record(VkCommandBuffer cb, VkImage swapchainImage, uint64_t frameCou
         }
     }
 
+    // ---- a source-raster measurement ----
+    if (_probeArmed) {
+        _probeArmed = false;
+        const uint32_t lines = (uint32_t) MaxSampledLines();
+        const uint32_t rows = _swapHeight < lines ? _swapHeight : lines;
+        const uint32_t cols = _swapWidth < lines ? _swapWidth : lines;
+        const VkDeviceSize rowBytes = VkDeviceSize(_swapWidth) * rows * 4;
+        const VkDeviceSize colBytes = VkDeviceSize(_swapHeight) * cols * 4;
+        const VkDeviceSize want = rowBytes + colBytes;
+
+        if (_probeBytes != want) DropHostBuffer(_vk, _device, _probe);
+        if (!_probe.buffer && MakeHostBuffer(_vk, _instance, _device, _physical, _probe, want,
+                                             VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
+            _probeBytes = want;
+        }
+
+        if (_probe.buffer && FormatBytes(_chainFormat) == 4 && rows >= 2 && cols >= 2) {
+            Transition(_vk, cb, _frame, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+            // Scanlines spread over the whole frame rather than a band in the middle: a letterboxed
+            // game has black bars, and a band inside one measures nothing.
+            std::vector<VkBufferImageCopy> regions;
+            regions.reserve(rows + cols);
+            for (uint32_t n = 0; n < rows; ++n) {
+                VkBufferImageCopy r {};
+                r.bufferOffset = VkDeviceSize(_swapWidth) * n * 4;
+                r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                r.imageOffset = {0, (int32_t) ((uint64_t) n * (_swapHeight - 1) / (rows - 1)), 0};
+                r.imageExtent = {_swapWidth, 1, 1};
+                regions.push_back(r);
+            }
+            // One column is a 1-wide, full-height copy, which lands in the buffer as that column's
+            // texels end to end -- a packed strip whose "scanlines" run down the frame.
+            for (uint32_t m = 0; m < cols; ++m) {
+                VkBufferImageCopy r {};
+                r.bufferOffset = rowBytes + VkDeviceSize(_swapHeight) * m * 4;
+                r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                r.imageOffset = {(int32_t) ((uint64_t) m * (_swapWidth - 1) / (cols - 1)), 0, 0};
+                r.imageExtent = {1, _swapHeight, 1};
+                regions.push_back(r);
+            }
+            _vk->vkCmdCopyImageToBuffer(cb, _frame.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                        _probe.buffer, (uint32_t) regions.size(), regions.data());
+            _probeLines = rows < cols ? rows : cols;
+            _probeColOffset = rowBytes;
+            _probePending = true;
+        }
+    }
+
     // ---- back into the swapchain ----
     Transition(_vk, cb, last, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     TransitionForeign(_vk, cb, swapchainImage, externalLayout,
@@ -1737,7 +1797,57 @@ void Chain::FrameCompleted() {
     if (_lutStaging.buffer && _lutUploads.empty()) DropHostBuffer(_vk, _device, _lutStaging);
 
     WriteCapture();
+    ReadGridProbe();
     ConsumeSelfTest();
+}
+
+void Chain::RequestGridProbe() { _probeArmed = true; }
+
+bool Chain::TakeGridEstimate(GridEstimate* out) {
+    if (!_probeReady) return false;
+    _probeReady = false;
+    *out = _probeResult;
+    return true;
+}
+
+// Turn the two strips into luma and measure each axis. Runs on the caller's thread once a frame's
+// work has retired, which is why only the sampled scanlines were read back: converting a whole frame
+// here would be a visible hitch every few seconds on the game's own thread.
+void Chain::ReadGridProbe() {
+    if (!_probePending || !_probe.mapped) return;
+    _probePending = false;
+
+    const uint32_t rows = _swapHeight < (uint32_t) MaxSampledLines() ? _swapHeight
+                                                                    : (uint32_t) MaxSampledLines();
+    const uint32_t cols = _swapWidth < (uint32_t) MaxSampledLines() ? _swapWidth
+                                                                   : (uint32_t) MaxSampledLines();
+    const uint8_t* bytes = (const uint8_t*) _probe.mapped;
+
+    auto toLuma = [this](const uint8_t* px, uint8_t* out) {
+        uint8_t rgb[3] = {0, 0, 0};
+        if (!ChainTexelToRgb(_chainFormat, px, rgb)) return false;
+        // Rec. 601 weights in integers. The detector only cares about where luma changes, so the
+        // exact primaries do not matter -- what matters is that a colour change is not cancelled.
+        *out = (uint8_t) ((77 * rgb[0] + 150 * rgb[1] + 29 * rgb[2]) >> 8);
+        return true;
+    };
+
+    std::vector<uint8_t> strip;
+    strip.resize((size_t) _swapWidth * rows);
+    for (size_t i = 0; i < strip.size(); ++i)
+        if (!toLuma(bytes + i * 4, &strip[i])) return;
+    float cx = 0.0f;
+    const float sx = DetectStripPeriod(strip.data(), (int) _swapWidth, (int) rows, &cx);
+
+    strip.resize((size_t) _swapHeight * cols);
+    const uint8_t* colBytes = bytes + _probeColOffset;
+    for (size_t i = 0; i < strip.size(); ++i)
+        if (!toLuma(colBytes + i * 4, &strip[i])) return;
+    float cy = 0.0f;
+    const float sy = DetectStripPeriod(strip.data(), (int) _swapHeight, (int) cols, &cy);
+
+    _probeResult = CombineAxes(sx, cx, sy, cy);
+    _probeReady = true;
 }
 
 void Chain::ConsumeSelfTest() {

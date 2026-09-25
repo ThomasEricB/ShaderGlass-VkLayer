@@ -36,7 +36,9 @@ process that does not ask for it.
 #include <vector>
 
 #include "../../common/shm_protocol.h"
+#include "chain_order.h"
 #include "chain.h"
+#include "crash_trace.h"
 #include "log.h"
 #include "vk_table.h"
 
@@ -221,6 +223,15 @@ struct SwapchainState {
     // submit, which keeps the game's thread out of the GPU's way for the whole of the chain.
     bool fencePending = false;
 
+    // Source auto-detection. The candidate is what the last measurement said; it only becomes the
+    // published raster once a second measurement agrees with it, because one frame is a bad witness
+    // -- a fade to black, a full-screen menu or a title card all measure differently from the game.
+    double lastProbeMs = 0.0;
+    uint32_t probeCandidateW = 0, probeCandidateH = 0;
+    bool autoSourceWasOn = false;
+    uint32_t autoSourceRefreshSeen = 0;
+    bool autoSourceRefreshSeeded = false;
+
     bool resourcesReady = false;
     bool resourcesFailed = false;
 };
@@ -238,7 +249,16 @@ struct DeviceChain {
     // The last captureRequest seen. The interface only ever increments it, so any difference is a
     // request; storing the count rather than a flag means a second request while the first is still
     // in flight is not lost.
+    //
+    // Seeded from whatever the mapping already holds rather than from zero. The counter outlives
+    // any one game -- it sits in a file -- so starting at zero made every game that launched after
+    // a capture take one of its own, unasked, on its first composed frame.
     uint32_t captureSeen = 0;
+    bool captureSeeded = false;
+
+    // What was last published as the layer's reason, so an unchanged one is not rewritten every
+    // frame -- the string is guarded by a sequence a reader retries on.
+    std::string lastNotice;
 
     PFN_vkDestroyDevice vkDestroyDevice = nullptr;
     PFN_vkGetDeviceQueue vkGetDeviceQueue = nullptr;
@@ -261,10 +281,20 @@ struct DeviceChain {
     std::unordered_map<VkSwapchainKHR, SwapchainState> swapchains;
     std::unordered_map<VkQueue, uint32_t> queueFamilies;
 
+    // Where DLSS5VKLayer sits relative to this layer, if it is in the chain at all.
+    DlssPosition dlss = DlssPosition::Absent;
+
     ShmMap shm;
     uint64_t framesSeen = 0;
     double lastFpsSampleMs = 0.0;
     uint64_t lastFpsFrames = 0;
+
+    // Why the last present did not composite, as a string literal compared by identity. The present
+    // hook has several early-outs that skip a frame without a word, so when the picture stops the
+    // log simply goes quiet and says nothing about which one was taken. Latching the reason turns
+    // that silence into one line per transition.
+    std::atomic<const char*> lastSkip {nullptr};
+    std::atomic<uint64_t> presentCalls {0};
 };
 
 std::unordered_map<VkInstance, InstanceChain> g_instances;
@@ -281,8 +311,23 @@ struct PrimarySwap {
     VkDevice device = VK_NULL_HANDLE;
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     uint64_t area = 0;
+    double lastPresentMs = 0.0;
 };
 PrimarySwap g_primary;
+
+// How long the swapchain holding the effect may go without presenting before an equally large one
+// is allowed to take over.
+//
+// A game is not always one swapchain. Wine ports in particular play their movies on one graphics
+// API and the game itself on another, which is two swapchains of identical size taking turns, and
+// the claim used to be first-come-and-keep-forever: whichever presented first held the effect, and
+// the other was refused every frame for the rest of the run. Handing over on silence follows the
+// one that is actually on screen.
+//
+// Long enough that two swapchains presenting side by side cannot flip-flop -- a holder that keeps
+// presenting is never silent, so it is never challenged -- and short enough that the gap at a
+// movie-to-game cut is a few frames rather than something to notice.
+constexpr double kPrimaryHandoverMs = 250.0;
 
 // Its own mutex, never nested with dc->lock or g_stateMutex, so the lock order in the present hook
 // cannot invert against the device hooks.
@@ -290,12 +335,27 @@ std::mutex g_primaryMutex;
 
 bool ClaimPrimary(VkDevice device, VkSwapchainKHR swapchain, uint32_t w, uint32_t h) {
     std::lock_guard<std::mutex> lk(g_primaryMutex);
+    const double now = NowMs();
     const uint64_t area = uint64_t(w) * h;
-    if (g_primary.swapchain == swapchain && g_primary.device == device) return true;
-    if (g_primary.swapchain != VK_NULL_HANDLE && area <= g_primary.area) return false;
+
+    // The holder renewing its own claim, which is the common case and the only one that keeps the
+    // handover clock from running.
+    if (g_primary.swapchain == swapchain && g_primary.device == device) {
+        g_primary.lastPresentMs = now;
+        return true;
+    }
+
+    const bool vacant = g_primary.swapchain == VK_NULL_HANDLE;
+    const bool silent = !vacant && (now - g_primary.lastPresentMs) > kPrimaryHandoverMs;
+
+    // Bigger always wins, as before -- that is what keeps a one-pixel or overlay swapchain from
+    // taking the effect off the game. Equal only wins once the holder has stopped presenting.
+    if (!vacant && !silent && area <= g_primary.area) return false;
+
     g_primary.device = device;
     g_primary.swapchain = swapchain;
     g_primary.area = area;
+    g_primary.lastPresentMs = now;
     return true;
 }
 
@@ -340,6 +400,11 @@ bool DuplicateLayerCopy() {
 bool LayerEnabled() {
     static const bool e = [] {
         if (DuplicateLayerCopy()) return false;
+        // Checked here as well as in the manifest, because the manifest's disable_environment only
+        // governs implicit enabling. Named in VK_INSTANCE_LAYERS -- which is how the layer is placed
+        // below DLSS5VKLayer -- it is loaded regardless, and without this the documented way to keep
+        // it out of one game would quietly stop doing anything.
+        if (const char* off = getenv("SHADERGLASS_DISABLE"); off && off[0] == '1') return false;
         const char* v = getenv("SHADERGLASS");
         return v && v[0] == '1';
     }();
@@ -405,11 +470,33 @@ void RememberQueue(DeviceChain* dc, VkQueue queue, uint32_t family) {
 // ---------------------------------------------------------------------------
 // Chain resources
 // ---------------------------------------------------------------------------
+// How long the layer will wait for its own work before deciding the device is not going to finish
+// it. Generous next to any frame a game presents, and finite -- which is the point. This code runs
+// on the game's present thread, so an unbounded wait is not a slow layer, it is a hung game with no
+// explanation and nothing on screen to say why.
+constexpr uint64_t kFenceTimeoutNs = 2ull * 1000 * 1000 * 1000;
+
 void DestroySwapchainResources(DeviceChain* dc, SwapchainState& sc) {
     // Nothing of ours may be in flight against the surfaces the chain is about to free.
+    bool retired = true;
     if (sc.fencePending && dc->table.vkWaitForFences)
-        dc->table.vkWaitForFences(dc->self, 1, &sc.fence, VK_TRUE, UINT64_MAX);
+        retired = dc->table.vkWaitForFences(dc->self, 1, &sc.fence, VK_TRUE, kFenceTimeoutNs) ==
+                  VK_SUCCESS;
     sc.fencePending = false;
+
+    if (!retired) {
+        // The work never finished, so the images and the command buffer it referenced may still be
+        // read by the device. Leaking them is wrong; freeing them is worse -- it is a use-after-free
+        // inside someone's game. The chain is dropped without its resources being reclaimed, and
+        // the process is on its way out of using this layer anyway.
+        Log("[layer] the device did not retire our work; leaving this chain's resources alone");
+        (void) sc.chain.release();
+        sc.fence = VK_NULL_HANDLE;
+        sc.pool = VK_NULL_HANDLE;
+        sc.cb = VK_NULL_HANDLE;
+        sc.resourcesReady = false;
+        return;
+    }
 
     sc.chain.reset();
     if (sc.fence) dc->table.vkDestroyFence(dc->self, sc.fence, nullptr);
@@ -470,9 +557,22 @@ bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue, VkImage 
     // The previous frame's chain, if it is still running, must finish before anything here touches
     // the surfaces it reads or the command buffer it was recorded into.
     if (sc.fencePending) {
-        if (!NoteVk(dc, dc->table.vkWaitForFences(dc->self, 1, &sc.fence, VK_TRUE, UINT64_MAX),
-                    "vkWaitForFences"))
+        const VkResult waited =
+            dc->table.vkWaitForFences(dc->self, 1, &sc.fence, VK_TRUE, kFenceTimeoutNs);
+        if (waited == VK_TIMEOUT) {
+            // Two seconds is not a slow frame, it is work that is never going to complete. Stop
+            // rather than wait again next frame -- retrying would hold the game's present thread
+            // for two seconds per frame, which is a frozen game either way.
+            Log("[layer] the device did not finish a composed frame within %llu ms; "
+                "giving up on this swapchain",
+                (unsigned long long) (kFenceTimeoutNs / 1000000));
+            if (dc->shm.hdr)
+                ShmStoreString(dc->shm.hdr->layerReasonSeq, dc->shm.hdr->layerReason, kReasonBytes,
+                               "the GPU did not finish a composed frame; chain stopped");
+            sc.resourcesFailed = true;
             return false;
+        }
+        if (!NoteVk(dc, waited, "vkWaitForFences")) return false;
         dc->table.vkResetFences(dc->self, 1, &sc.fence);
         sc.fencePending = false;
 
@@ -626,6 +726,8 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateInstance(const VkInstanceCreateInfo* p
 
     std::lock_guard<std::mutex> lk(g_stateMutex);
     g_instances[*pInstance] = chain;
+    if (Verbose()) Log("[chain] instance %p registered (%zu total)", (void*) *pInstance,
+                       g_instances.size());
     return VK_SUCCESS;
 }
 
@@ -653,9 +755,14 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_EnumeratePhysicalDevices(VkInstance instance
     if (!chain || !chain->vkEnumeratePhysicalDevices) return VK_ERROR_INITIALIZATION_FAILED;
 
     const VkResult res = chain->vkEnumeratePhysicalDevices(instance, pCount, pPhysicalDevices);
-    if (res == VK_SUCCESS && pPhysicalDevices) {
+    // VK_INCOMPLETE too: the caller asked for fewer devices than exist and got a short answer, and
+    // the ones it did get are still this instance's. Registering only on VK_SUCCESS left those
+    // unattributed, and an unattributed physical device used to take the layer inert.
+    if ((res == VK_SUCCESS || res == VK_INCOMPLETE) && pPhysicalDevices && pCount) {
         std::lock_guard<std::mutex> lk(g_stateMutex);
         for (uint32_t i = 0; i < *pCount; ++i) g_phys[pPhysicalDevices[i]] = chain;
+        if (Verbose())
+            Log("[chain] enumerated %u physical device(s) (res=%d)", *pCount, (int) res);
     }
     return res;
 }
@@ -691,11 +798,31 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(VkPhysicalDevice physicalDevice
     }
 
     InstanceChain* ic = nullptr;
+    bool attributed = true;
     {
         std::lock_guard<std::mutex> lk(g_stateMutex);
         auto it = g_phys.find(physicalDevice);
-        if (it != g_phys.end()) ic = it->second;
+        if (it != g_phys.end()) {
+            ic = it->second;
+        } else if (g_instances.size() == 1) {
+            // A physical device this layer never saw enumerated. That happens when something above
+            // it in the chain obtained the handle by a route this layer does not hook -- device
+            // groups, or a cached handle from before -- and it is routine when another layer sits
+            // above: DLSS5VKLayer produces exactly this.
+            //
+            // With one instance the attribution is not in doubt, so use it. The alternative, which
+            // is what this did before, was to go inert and shade nothing at all, which is a bad
+            // trade for a bookkeeping miss.
+            ic = &g_instances.begin()->second;
+            attributed = false;
+        }
     }
+
+    // On the way down, and the only unambiguous marker of chain position there is. Every other line
+    // this layer writes during device creation is written on the way back up, so their order is the
+    // reverse of the chain's -- which is exactly how the order here was misread once already. A
+    // layer above this one has already printed its own entry line by the time this runs.
+    if (Verbose()) Log("[chain] entering vkCreateDevice");
 
     link->u.pLayerInfo = link->u.pLayerInfo->pNext;
     const VkResult res = create(physicalDevice, pCreateInfo, pAllocator, pDevice);
@@ -737,10 +864,28 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(VkPhysicalDevice physicalDevice
         snprintf(deviceName, sizeof(deviceName), "%s", props.deviceName);
     }
 
+    // Where we landed relative to DLSS5VKLayer, answered from the pointer the chain below us just
+    // gave for presenting. Worked out here because this is the first moment that pointer exists,
+    // and reported once per device rather than per frame.
+    std::string nextOwner;
+    if (LayerEnabled()) dc->dlss = FindDlssPosition((void*) dc->vkQueuePresentKHR, &nextOwner);
+
     std::lock_guard<std::mutex> lk(g_stateMutex);
     g_devices[*pDevice] = dc;
+    // Nothing from here on is anyone's business unless the layer is switched on in this process.
+    if (!LayerEnabled()) return VK_SUCCESS;
     Log("[layer] device %p on %s (inert=%d enabled=%d)", (void*) *pDevice, deviceName,
         (int) dc->inert.load(), (int) LayerEnabled());
+    if (!attributed)
+        Log("[layer] physical device %p was not enumerated through this layer; attributed to the "
+            "only instance",
+            (void*) physicalDevice);
+    if (Verbose()) Log("[layer] next present belongs to %s", nextOwner.c_str());
+    if (dc->dlss != DlssPosition::Absent)
+        Log("[layer] %s", DescribeDlssPosition(dc->dlss));
+    if (DlssOrderIsWrong(dc->dlss))
+        Log("[layer] the shader will be reconstructed by DLSS rather than finishing the picture; "
+            "see docs/DLSS5VKLayer.md");
     return VK_SUCCESS;
 }
 
@@ -861,15 +1006,24 @@ VKAPI_ATTR void VKAPI_CALL Hook_DestroySwapchainKHR(VkDevice device, VkSwapchain
     ReleasePrimary(device, swapchain);
     {
         std::unique_lock<std::mutex> lk(dc->lock);
-        auto it = dc->swapchains.find(swapchain);
-        if (it != dc->swapchains.end()) {
+        if (dc->swapchains.count(swapchain)) {
             // Outside the lock: a device-wide wait must not be taken while holding a lock the
             // present path also wants.
             lk.unlock();
             if (dc->vkDeviceWaitIdle) dc->vkDeviceWaitIdle(device);
             lk.lock();
-            DestroySwapchainResources(dc, it->second);
-            dc->swapchains.erase(it);
+
+            // Found again, not carried across the gap. swapchains is an unordered_map, so any
+            // insert rehashes it and invalidates every iterator -- and the insert that does it is
+            // the *new* swapchain being created, which is precisely what happens either side of a
+            // resolution or mode change. Holding the iterator over the unlock made recreating a
+            // swapchain a use-after-free, which is what took games down when they changed mode.
+            auto it = dc->swapchains.find(swapchain);
+            if (it != dc->swapchains.end()) {
+                Log("[layer] swapchain %p destroyed", (void*) swapchain);
+                DestroySwapchainResources(dc, it->second);
+                dc->swapchains.erase(it);
+            }
         }
     }
     if (dc->vkDestroySwapchainKHR) dc->vkDestroySwapchainKHR(device, swapchain, pAllocator);
@@ -880,25 +1034,101 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_AcquireNextImageKHR(VkDevice device, VkSwapc
                                                         VkFence fence, uint32_t* pImageIndex) {
     DeviceChain* dc = FindDevice(device);
     if (!dc || !dc->vkAcquireNextImageKHR) return VK_ERROR_INITIALIZATION_FAILED;
-    std::lock_guard<std::mutex> lk(dc->lock);
+
+    // No lock here, and never one again. This call blocks until the presentation engine hands back
+    // an image, and the only call that hands one back is vkQueuePresentKHR -- which wanted the same
+    // device-wide lock. Acquiring it here deadlocked the two against each other: the game thread
+    // sat in acquire holding the lock, the presenter thread sat on the lock unable to present, and
+    // neither ever moved. It survived ordinary play because acquire returned immediately while the
+    // pool had spare images; it closed the moment anything put one more frame in flight, such as a
+    // game opening its menu.
+    //
+    // Nothing here touches layer state, so there is nothing for a lock to protect. The same is true
+    // of the queue hooks below.
     return dc->vkAcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, pImageIndex);
 }
 
 // ---------------------------------------------------------------------------
 // Present
 // ---------------------------------------------------------------------------
+// Two measured rasters this close are the same raster. Proportional rather than absolute: a frame of
+// real game art does not measure to the same hundredth twice running, and every accepted change
+// rebuilds the whole chain -- at a 19-pass preset that is a visible hitch, so drift inside the
+// measurement's own noise must not buy one.
+bool Near(uint32_t a, uint32_t b) {
+    const uint32_t hi = a > b ? a : b;
+    const uint32_t diff = a > b ? a - b : b - a;
+    const uint32_t slack = hi / 32;  // about 3%
+    return diff <= (slack < 2 ? 2 : slack);
+}
+
+
+// Drop the measured raster, so ShmSourceExtent falls back to the mode the user chose.
+void ForgetMeasuredSource(ShmHeader* hdr) {
+    hdr->autoSourceWidth.store(0);
+    hdr->autoSourceHeight.store(0);
+    hdr->autoSourceScaleXBits.store(0);
+    hdr->autoSourceScaleYBits.store(0);
+    hdr->autoSourceConfidenceBits.store(0);
+    hdr->autoSourceSeq.fetch_add(1);
+}
+
+// Says why a frame went through untouched, once per change of answer rather than once per frame.
+// Every early-out below used to be silent, so "the shader stopped applying" and "the hook stopped
+// being called" produced identical logs -- nothing at all. Reasons are string literals and compared
+// by identity, which is what makes the once-per-transition test cheap enough to sit in the hot path.
+void NoteSkip(DeviceChain* dc, const char* why) {
+    if (dc->lastSkip.exchange(why) == why) return;
+    Log("[present] not compositing: %s (after %llu calls)", why,
+        (unsigned long long) dc->presentCalls.load());
+}
+
+void NoteComposited(DeviceChain* dc) {
+    const char* was = dc->lastSkip.exchange(nullptr);
+    if (was) Log("[present] compositing again (was: %s)", was);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
                                                     const VkPresentInfoKHR* pPresentInfo) {
     DeviceChain* dc = DeviceForQueue(queue);
-    if (!dc || !dc->vkQueuePresentKHR) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!dc || !dc->vkQueuePresentKHR) {
+        // The last silent path in the hook, and the worst one: it fails the present outright
+        // without calling down, so the application loses the frame and the log says nothing. Once
+        // is enough to know it happened.
+        static std::once_flag once;
+        std::call_once(once, [queue] {
+            Log("[present] no device chain for queue %p -- presenting is being refused",
+                (void*) queue);
+        });
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
 
-    if (dc->inert || !LayerEnabled()) return dc->vkQueuePresentKHR(queue, pPresentInfo);
+    // Counted before any early-out, so the log can tell a hook that stopped being called from one
+    // that is still called and declining to do anything.
+    const uint64_t call = dc->presentCalls.fetch_add(1) + 1;
+    if (Verbose() && call % 600 == 0)
+        Log("[present] %llu calls seen", (unsigned long long) call);
 
-    // Held to the end, alongside the submit hooks. Vulkan requires external synchronization for every
-    // operation on a queue, and phase 6's idle repaint will submit on the application's own queue.
-    std::lock_guard<std::mutex> lk(dc->lock);
+    if (dc->inert || !LayerEnabled()) {
+        // Only worth a line when the layer was switched on. Switched off is the normal state of
+        // every other Vulkan program in the session -- the layer is loaded into all of them so that
+        // it can sit below DLSS5VKLayer -- and reporting that would put a line in each one's stderr.
+        if (LayerEnabled()) NoteSkip(dc, "device went inert");
+        return dc->vkQueuePresentKHR(queue, pPresentInfo);
+    }
 
-    if (!ShmOpen(dc->shm)) return dc->vkQueuePresentKHR(queue, pPresentInfo);
+    // Held across the layer's own work -- which is what it is for, since that work walks
+    // dc->swapchains and the chain objects hanging off it -- and released before the call goes down
+    // the chain. Presenting is not layer state, and in FIFO it blocks until the display is ready:
+    // holding a device-wide lock across it would stall every other thread on the device for a frame
+    // at a time, which is the same mistake the acquire hook used to make.
+    std::unique_lock<std::mutex> lk(dc->lock);
+
+    if (!ShmOpen(dc->shm)) {
+        NoteSkip(dc, "no shared-memory mapping");
+        lk.unlock();
+        return dc->vkQueuePresentKHR(queue, pPresentInfo);
+    }
 
     static std::once_flag namePublished;
     std::call_once(namePublished, [dc] { PublishGameName(dc); });
@@ -930,14 +1160,32 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
     // path after that presents with none.
     bool waitsConsumed = false;
 
+    // Why nothing was composited, reported only if nothing was. A present may carry swapchains the
+    // layer does not drive alongside the one it does, so a per-swapchain complaint would cry wolf
+    // every frame; the answer is only interesting once the whole present has come up empty.
+    const char* skip = nullptr;
+    bool handledAny = false;
+
     for (uint32_t i = 0; i < pPresentInfo->swapchainCount; ++i) {
         auto sit = dc->swapchains.find(pPresentInfo->pSwapchains[i]);
-        if (sit == dc->swapchains.end()) continue;
+        if (sit == dc->swapchains.end()) {
+            if (!skip) skip = "swapchain not known to the layer";
+            continue;
+        }
         SwapchainState& sc = sit->second;
-        if (sc.passThrough || pPresentInfo->pImageIndices[i] >= sc.images.size()) continue;
+        if (sc.passThrough || pPresentInfo->pImageIndices[i] >= sc.images.size()) {
+            if (!skip)
+                skip = sc.passThrough ? "swapchain marked pass-through"
+                                      : "image index outside the swapchain";
+            continue;
+        }
 
         // One swapchain drives the effect; the rest present raw.
-        if (!ClaimPrimary(dc->self, pPresentInfo->pSwapchains[i], sc.width, sc.height)) continue;
+        if (!ClaimPrimary(dc->self, pPresentInfo->pSwapchains[i], sc.width, sc.height)) {
+            if (!skip) skip = "another swapchain holds the effect";
+            continue;
+        }
+        handledAny = true;
 
         sc.queue = queue;
         ++dc->framesSeen;
@@ -961,9 +1209,91 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
                 if (dc->shm.hdr) {
                     const uint32_t want =
                         dc->shm.hdr->captureRequest.load(std::memory_order_acquire);
-                    if (want != dc->captureSeen) {
+                    if (!dc->captureSeeded) {
+                        // Whatever is in there was asked for before this game existed.
+                        dc->captureSeeded = true;
+                        dc->captureSeen = want;
+                    } else if (want != dc->captureSeen) {
                         dc->captureSeen = want;
                         if (sc.chain) sc.chain->RequestCapture();
+                    }
+                }
+
+                // A measurement is asked for on a timer and collected whenever it is ready, which
+                // is the frame after. Neither costs anything on the frames in between.
+                if (dc->shm.hdr) {
+                    ShmHeader* hdr = dc->shm.hdr;
+                    const bool on = hdr->autoSourceEnabled.load() != 0;
+
+                    // Two ways to be told to start again: the interface bumping the refresh
+                    // counter, and the toggle changing under a layer that was running to see it.
+                    // The counter is the reliable one -- a toggle flipped while no game was
+                    // attached leaves no edge for anyone to notice -- and the edge is kept because
+                    // shaderglass-ctl writes the toggle without bumping anything.
+                    const uint32_t refresh = hdr->autoSourceRefresh.load();
+                    if (!sc.autoSourceRefreshSeeded) {
+                        sc.autoSourceRefreshSeeded = true;
+                        sc.autoSourceRefreshSeen = refresh;
+                    }
+                    const bool asked = refresh != sc.autoSourceRefreshSeen;
+                    if (asked || on != sc.autoSourceWasOn) {
+                        sc.autoSourceRefreshSeen = refresh;
+                        sc.autoSourceWasOn = on;
+                        sc.probeCandidateW = sc.probeCandidateH = 0;
+                        sc.lastProbeMs = 0.0;  // measure on the next frame, not in two seconds
+                        ForgetMeasuredSource(hdr);
+                    }
+
+                    if (on && sc.chain) {
+                        uint32_t every = hdr->autoSourceIntervalMs.load();
+                        if (!every) every = kAutoSourceDefaultMs;
+                        const double now = NowMs();
+                        if (now - sc.lastProbeMs >= double(every)) {
+                            sc.lastProbeMs = now;
+                            sc.chain->RequestGridProbe();
+                        }
+
+                        GridEstimate g {};
+                        if (sc.chain->TakeGridEstimate(&g)) {
+                            uint32_t aw = 0, ah = 0;
+                            if (GridToSourceExtent(g, sc.width, sc.height, &aw, &ah)) {
+                                const uint32_t curW = hdr->autoSourceWidth.load();
+                                const uint32_t curH = hdr->autoSourceHeight.load();
+                                // Applied on the strength of one measurement. An earlier version
+                                // waited for two in a row to agree, which was standing in for the
+                                // filtering the span guard and the raster floor now do properly --
+                                // and all it bought was a scene change taking two intervals to be
+                                // noticed, which is the opposite of what this is for.
+                                const bool changed = !Near(aw, curW) || !Near(ah, curH);
+
+                                if (changed) {
+                                    hdr->autoSourceScaleXBits.store(FloatToBits(g.scaleX));
+                                    hdr->autoSourceScaleYBits.store(FloatToBits(g.scaleY));
+                                    hdr->autoSourceConfidenceBits.store(FloatToBits(g.confidence));
+                                    hdr->autoSourceWidth.store(aw);
+                                    hdr->autoSourceHeight.store(ah);
+                                    hdr->autoSourceSeq.fetch_add(1);
+                                    Log("[source] measured %ux%u (x%.2f, y%.2f, confidence %.2f)",
+                                        aw, ah, double(g.scaleX), double(g.scaleY),
+                                        double(g.confidence));
+                                }
+                                sc.probeCandidateW = aw;
+                                sc.probeCandidateH = ah;
+                            } else {
+                                // Nothing measurable on this frame, and that is not news about the
+                                // game. A dark room, a movie, a fade, a menu over black -- none of
+                                // them mean the raster changed, because the raster is a property of
+                                // the game and not of the scene. The last answer stands.
+                                //
+                                // An earlier version dropped it after a run of such frames, on the
+                                // theory that a stale answer was worse than none. In a game it is
+                                // the other way round: walking into an unlit cave made the source
+                                // raster change underfoot, which is both visible and wrong. The way
+                                // out of a bad answer is the refresh request -- the toggle, or the
+                                // button -- which did not exist when that rule was written.
+                                sc.probeCandidateW = sc.probeCandidateH = 0;
+                            }
+                        }
                     }
                 }
 
@@ -976,6 +1306,17 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
                 // Set whether or not the chain succeeded: the submit waits on them before anything
                 // can fail, so they are consumed either way.
                 if (waitCount) waitsConsumed = true;
+
+                // Published every frame, so it appears as soon as there is something to say and
+                // disappears once there is not.
+                if (sc.chain && sc.chain->Usable()) {
+                    const char* notice = sc.chain->Notice();
+                    if (dc->lastNotice != notice) {
+                        dc->lastNotice = notice;
+                        ShmStoreString(dc->shm.hdr->layerReasonSeq, dc->shm.hdr->layerReason,
+                                       kReasonBytes, notice);
+                    }
+                }
 
                 if (!composed && sc.chain && !sc.chain->Usable()) {
                     // The chain declared itself unusable on this device. Stop trying rather than
@@ -1004,29 +1345,40 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
         }
     }
 
+    if (handledAny) NoteComposited(dc);
+    else if (skip) NoteSkip(dc, skip);
+
     if (TimeEnabled()) {
         static int frameNo = 0;
         if (++frameNo % TimeInterval() == 0)
             Log("[time] frames seen=%llu", (unsigned long long) dc->framesSeen);
     }
 
-    if (!waitsConsumed) return dc->vkQueuePresentKHR(queue, pPresentInfo);
+    if (!waitsConsumed) {
+        lk.unlock();
+        return dc->vkQueuePresentKHR(queue, pPresentInfo);
+    }
 
     // pNext is carried through untouched: present ids, present timing and the rest belong to the
     // caller, and none of them are about semaphores.
     VkPresentInfoKHR pi = *pPresentInfo;
     pi.waitSemaphoreCount = 0;
     pi.pWaitSemaphores = nullptr;
+    lk.unlock();
     return dc->vkQueuePresentKHR(queue, &pi);
 }
 
-// Every queue operation takes the device lock, so the application's submissions cannot overlap the
-// layer's own once phase 2 starts submitting.
+// Pass-throughs, and deliberately lock-free. These once took the device lock, on the theory that
+// the application's submissions must not overlap the layer's own. They must not -- but Vulkan
+// already requires the application to externally synchronize a queue, and the layer only ever
+// submits from inside vkQueuePresentKHR, during which the application guarantees it is not
+// submitting on that queue itself. The lock bought nothing and cost a deadlock: all three of these
+// can block in the driver, and a device-wide lock held across a call that blocks on the GPU stops
+// every other thread on the device.
 VKAPI_ATTR VkResult VKAPI_CALL Hook_QueueSubmit(VkQueue queue, uint32_t submitCount,
                                                 const VkSubmitInfo* pSubmits, VkFence fence) {
     DeviceChain* dc = DeviceForQueue(queue);
     if (!dc || !dc->vkQueueSubmit) return VK_ERROR_INITIALIZATION_FAILED;
-    std::lock_guard<std::mutex> lk(dc->lock);
     return dc->vkQueueSubmit(queue, submitCount, pSubmits, fence);
 }
 
@@ -1034,14 +1386,12 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_QueueSubmit2(VkQueue queue, uint32_t submitC
                                                  const VkSubmitInfo2* pSubmits, VkFence fence) {
     DeviceChain* dc = DeviceForQueue(queue);
     if (!dc || !dc->vkQueueSubmit2) return VK_ERROR_INITIALIZATION_FAILED;
-    std::lock_guard<std::mutex> lk(dc->lock);
     return dc->vkQueueSubmit2(queue, submitCount, pSubmits, fence);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL Hook_QueueWaitIdle(VkQueue queue) {
     DeviceChain* dc = DeviceForQueue(queue);
     if (!dc || !dc->vkQueueWaitIdle) return VK_ERROR_INITIALIZATION_FAILED;
-    std::lock_guard<std::mutex> lk(dc->lock);
     return dc->vkQueueWaitIdle(queue);
 }
 
@@ -1093,10 +1443,18 @@ vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* v) {
     // Once per process, not once per negotiate. The loader re-enumerates the implicit-layer directory
     // many times during a single instance creation and loads this library on each pass; announcing it
     // each time turns one line into hundreds in the user's log.
+    //
+    // Silent when SHADERGLASS is not set at all. The layer is named in the session's VK_INSTANCE_LAYERS
+    // so that it lands below DLSS5VKLayer (see docs/DLSS5VKLayer.md), and that loads it into every
+    // Vulkan program the user runs -- a banner in each of their stderr streams would be noise from a
+    // layer nobody asked to turn on. Set to anything else, it still announces itself: that is somebody
+    // who meant to enable it and wrote 0, or true, and the banner is how they find out.
     static std::once_flag announced;
     std::call_once(announced, [] {
         const char* e = getenv("SHADERGLASS");
-        Log("=== %s loaded (SHADERGLASS=%s) ===", VK_LAYER_NAME, e ? e : "(unset)");
+        if (!e) return;
+        Log("=== %s loaded (SHADERGLASS=%s) ===", VK_LAYER_NAME, e);
+        if (LayerEnabled()) InstallCrashTrace();
     });
     return VK_SUCCESS;
 }

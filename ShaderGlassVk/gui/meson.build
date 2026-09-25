@@ -27,6 +27,7 @@ executable('shaderglass-gui',
     'param_panel.cpp',
     'capture_view.cpp',
     'shm_binder.cpp',
+    'game_probe.cpp',
     # The catalogue loader is the layer's own, so the interface and the layer can never disagree
     # about what a catalogue contains or which ABI they accept.
     '../layer/src/catalogue.cpp',

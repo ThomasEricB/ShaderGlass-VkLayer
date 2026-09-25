@@ -19,6 +19,7 @@ frame.
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <unistd.h>
 
 namespace shaderglass {
 
@@ -41,8 +42,13 @@ inline void Log(const char* fmt, ...) {
     va_start(args, fmt);
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
+    // The pid and word size are part of every line because they have to be. A launch loads this
+    // layer into every process the loader touches -- the game, the Steam helpers, the service
+    // processes -- and they all append to one file. Without them, two devices in the log cannot be
+    // told apart from two processes each with one device, and reading the merged file as though it
+    // came from the game alone invents contention that is not there.
     std::lock_guard<std::mutex> lk(LogMutex());
-    fprintf(LogSink(), "[shaderglass] %s\n", buf);
+    fprintf(LogSink(), "[shaderglass %d/%zu] %s\n", (int) getpid(), sizeof(void*) * 8, buf);
     fflush(LogSink());
 }
 
