@@ -1,6 +1,6 @@
 # ShaderGlass on a Vulkan layer — design and port plan
 
-**Status:** phases 1-6 complete (tree, builds, protocol, layer, the full multi-pass executor, the .slangp -> SPIR-V compiler with a generated catalogue, the interface, and the output controls). The full libretro `slang-shaders` tree compiles: 3328 of 3330 presets, the other 2 being parameter fragments rather than presets, and 49 files failing only on dangling references that are broken in upstream itself. Phase 7 (packaging and the PR) next.
+**Status:** all seven phases complete (tree, builds, protocol, layer, the full multi-pass executor, the .slangp -> SPIR-V compiler with a generated catalogue, the interface, the output controls, and packaging). The full libretro `slang-shaders` tree compiles: 3328 of 3330 presets, the other 2 being parameter fragments rather than presets, and 49 files failing only on dangling references that are broken in upstream itself.
 **Scope:** everything below is additive under `ShaderGlassVk/`. No existing upstream file is modified,
 moved or deleted, so the Windows app builds exactly as it does today.
 
@@ -159,7 +159,7 @@ alias — `Pass1` in 891 presets — and resolves through the alias mechanism.
 | **The interface publishes parameter *overrides*, not values** | The layer already resolves each parameter as shader default, then preset override, then whatever the interface set. So the shared block only has to carry the third — and a Mega Bezel preset with several hundred parameters still fits in the 128 slots the protocol reserves, because a parameter nobody has touched is simply absent |
 | **Parameter names are written without bumping a sequence** | The only sequence guarding them is `presetSeq`, which also guards the preset id. Bumping it while a slider is being dragged would make the layer's guarded read of the id retry and, often enough, give up — and an empty id reads as "no preset" |
 | **Profiles are keyed by the names `shaderglass-ctl` uses**, not by the visible label | A profile keyed off the interface's wording would break when the wording changed, and would be written in whatever language the interface happened to be running in |
-| **Tabs are Shader, Input and Capture** — Output and Advanced arrive in phase 6 | Decision 15 named four tabs, but the layer does not yet honour pixel size, output policy, aspect, crop or frame skip. A tab of controls that do nothing reads as a bug rather than a plan |
+| **Tabs arrived with what they control** — Shader, Input and Capture in phase 5, Output and Advanced in phase 6 | A tab of controls the layer does not yet honour reads as a bug rather than a plan |
 | **`SHADERGLASS_GUI_GRAB` renders the window to a file and exits**, and `SHADERGLASS_GUI_TAB` picks the tab | The interface is the one part of this tree that cannot be checked by running it and reading a log. This makes "does it lay out, does the tree populate, does the parameter panel fill in" answerable the same way everything else here is |
 | **Captures are PPM** | Qt reads them natively and the layer needs no encoder — which matters for a library mapped into every game. The pair is what the chain already has in hand: the frame the game presented and the frame it presented after |
 
@@ -173,6 +173,18 @@ alias — `Pass1` in 891 presets — and resolves through the alias mechanism.
   unsupported swapchain format or any failed Vulkan call ends with the game's own frame presented.
 - **`SHADERGLASS=1`** in the manifest's `enable_environment`, mirroring `VKLayer_DLSS5=1`, so the
   layer is inert in every process that does not ask for it.
+
+### Packaging (phase 7)
+
+| Decision | Why |
+|---|---|
+| **One staged tree, three formats.** `packaging/make-dist.sh` stages `root/usr` once; the tarball carries it with `install.sh`, the RPM and DEB take it as their payload, and the PKGBUILD packages it too | Four hand-written file lists would drift. One layout cannot |
+| **`/usr/lib/shaderglass` on every distribution**, holding both layers and both catalogues | Each layer finds its catalogue beside itself, whichever architecture it is, so the two belong in one directory. That makes it a private directory, not a 64-bit library directory in the sense `lib64` means |
+| **The layer order ships in `/usr/lib/environment.d`**, not written into every home directory by a post-install script | systemd reads it at login for every user. DLSS5VKLayer's packages wrote a file per user from `%post`, which misses users created later and leaves files behind that the package does not own. The name sorts after `dlssnr.conf`, so the value that sets is already there to append to |
+| **The catalogue is built from mausimus's `slang-shaders` fork at a pinned commit** | It is the tree the Windows app builds from (`Scripts/DownloadShaders.bat`), and the patches are made against one commit of it. A package built from a moving branch would one day find a patch that no longer applies — which `build-catalogue.sh` treats as fatal, rightly |
+| **The catalogue links libstdc++ statically**, as the layer already did | It is loaded into games, some of which bring their own older libstdc++; and a 32-bit install should not need a 32-bit libstdc++ just to read a table of shaders. Both catalogues now need only libc |
+| **A tarball install lists what it installed**, and `uninstall.sh` removes that list and nothing else | An uninstaller that works out paths again from options can disagree with the install it is undoing; a list cannot |
+| **glslang is not a hard dependency of the DEB** | Only `shaderglass-gen` links it, and Debian's package names for its shared libraries vary between releases. A wrong name would make the whole package uninstallable to save a developer tool |
 
 ### Source resolution and pixel size are two controls, not one
 
@@ -340,7 +352,7 @@ lost; what goes is capture and window management, which is exactly what the laye
 | 4 | **Done.** Full pass model — multi-pass, scale types, feedback/history, textures, per-pass formats. `tests/chain_test.cpp` builds and records every preset in the catalogue with no game and no window |
 | 5 | **Done.** `shaderglass-gui` — preset tree over the catalogue, parameter panel, profiles, live status, and the before/after view, with the layer-side capture that feeds it |
 | 6 | **Done.** Source resolution (with automatic detection), pixel size and output policy, aspect ratio, crop (numeric and dragged on a capture), flip/rotate, frame skip, pause, idle repaint, the gamescope launch helper (custom builds included), and shading gamescope's own output on every backend |
-| 7 | Packaging, docs, `RELICENSE.md`, PR preparation. Every package's build runs `tools/build-catalogue.sh`, which is what guarantees the shader patches reach an installed catalogue |
+| 7 | **Done.** Tarball with `install.sh --user/--system`, RPM, DEB and PKGBUILD from one staged tree (`packaging/`); every package's build runs `tools/build-catalogue.sh`, which is what guarantees the shader patches reach an installed catalogue. README, `RELICENSE.md` and this document brought up to date |
 
 ---
 

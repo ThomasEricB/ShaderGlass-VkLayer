@@ -1,2 +1,4 @@
 # Build trees. Meson and CMake both live under build/ so one rule covers them.
 build/
+# Release packages, from packaging/make-dist.sh.
+dist/

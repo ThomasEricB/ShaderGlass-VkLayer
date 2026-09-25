@@ -321,7 +321,11 @@ void EmitBuildFiles(const fs::path& out, const std::vector<std::string>& files) 
         c << "  sg_index.cpp\n";
         c << ")\n";
         c << "target_include_directories(ShaderGlassPresets PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})\n";
-        c << "set_target_properties(ShaderGlassPresets PROPERTIES PREFIX \"lib\")\n\n";
+        c << "set_target_properties(ShaderGlassPresets PROPERTIES PREFIX \"lib\")\n";
+        // Loaded into games, like the layer, and linked like it: a game's own libstdc++ may be
+        // older than the one this was built against -- Steam's runtime ships its own -- and a
+        // 32-bit install should not need a 32-bit libstdc++ just to read a table of shaders.
+        c << "target_link_options(ShaderGlassPresets PRIVATE -static-libstdc++ -static-libgcc)\n\n";
 
         // A shared object has an architecture, and a 32-bit game cannot load a 64-bit catalogue.
         // The two are named apart for the same reason the layers are, so both can sit in one

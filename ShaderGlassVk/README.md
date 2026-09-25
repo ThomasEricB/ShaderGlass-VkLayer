@@ -12,14 +12,59 @@ and intercepts `vkQueuePresentKHR`, where the finished frame is already in hand.
 This tree is additive. Nothing outside `ShaderGlassVk/` is touched, and the Windows app builds
 exactly as it did before.
 
-> **Status: phase 3 of 7.** The layer runs a real shader pass over the game's frames, and
-> `shaderglass-gen` compiles libretro `.slangp` presets into a SPIR-V catalogue that builds into a
-> loadable library. Phase 4 connects the two: running catalogue presets instead of the built-in
-> passthrough. See [DESIGN.md](DESIGN.md) for the full plan.
+It runs the whole libretro `slang-shaders` catalogue — about 3300 presets, CRT, scanline, handheld,
+upscaling — on any Vulkan game, 64-bit or 32-bit, including Proton/DXVK games. OpenGL games reach it
+through Zink or through gamescope. [DESIGN.md](DESIGN.md) has the design and every decision behind it.
+
+## Installing
+
+Every package holds the same files: both layers and both preset catalogues in `/usr/lib/shaderglass`,
+the programs `shaderglass-gui`, `shaderglass-ctl`, `shaderglass-run` and `shaderglass-gen`, one Vulkan
+manifest per architecture, and `zz-shaderglass.conf` in `environment.d` (see *Running a game*).
+
+| | |
+|---|---|
+| Arch | `packaging/PKGBUILD` — builds from source, the catalogue included |
+| Fedora and other RPM systems | `packaging/make-dist.sh rpm` |
+| Debian, Ubuntu | `packaging/make-dist.sh deb` (needs `dpkg-deb`) |
+| Anywhere | `packaging/make-dist.sh` makes a tarball; inside it, `./install.sh` installs for you under `~/.local`, `./install.sh --system` for everyone under `/usr/local` |
+
+`make-dist.sh` builds whatever is not built yet, catalogue included, which takes a few minutes. A
+tarball install records what it put where, and `~/.local/lib/shaderglass/uninstall.sh` removes
+exactly that.
+
+**Log out and back in once after installing.** The layer order is read when the session starts.
+
+## Running a game
+
+Add this to the game's launch options in Steam — or put it in front of the command anywhere else:
+
+```
+SHADERGLASS=1 %command%
+```
+
+Then open **ShaderGlass** (`shaderglass-gui`), pick a preset, and tune it while the game runs. Nothing
+happens to a game started without `SHADERGLASS=1`.
+
+- **OpenGL games** are invisible to a Vulkan layer. The interface says so when a game switches to
+  OpenGL, and offers the launch options that route it through Vulkan with Zink. Running the game in
+  gamescope works too; see the Advanced tab.
+- **Presets made for a console** — `bezel/scanline-classic` above all, whose composite and S-video
+  presets model the signal a SNES or a Mega Drive sent to a TV — expect that console's raster, like
+  256×224, as their input. Fed a 2560×1080 frame they come out colourless and striped. Set the source
+  raster on the Input tab to the console's, or let *Detect automatically* measure a pixel-art game.
+- **HDR presets** (`fhd-hdr`, `uhd-4k-hdr`) produce an HDR10 signal and look washed out on an SDR
+  screen; use the `-sdr` ones there.
+- **Handheld overlays for PSP** come in two versions; the `Y_flip` ones are the right way up here.
+- **DLSS5VKLayer** is supported: installed together, ShaderGlass runs after it and shades the finished
+  picture. See [docs/DLSS5VKLayer.md](docs/DLSS5VKLayer.md).
+
+`shaderglass-run [--gamescope[=output]] command...` does the same from a terminal or a `.desktop` file.
 
 ## Building
 
-Needs a C++17 compiler, Vulkan headers, and Meson or CMake.
+Needs a C++17 compiler, Vulkan headers, Meson or CMake, glslang (for the preset compiler) and, for
+the interface, Qt 6.
 
 Two optional headers, each detected at configure time, each degrading to something that still works:
 
@@ -32,14 +77,20 @@ stb_image is header-only, so it adds nothing to what the layer links against —
 a library mapped into every game on the system. If you add it to an existing build tree, CMake caches
 the earlier negative result: configure a fresh one, or `meson setup --clearcache --reconfigure`.
 
+Everything, both architectures:
+
+```bash
+tools/build.sh             # the layers, the tools and the interface
+tools/build-catalogue.sh   # the preset catalogue, both architectures (see Compiling presets)
+```
+
+or by hand:
+
 ```bash
 meson setup build/native --native-file meson/native-clang.ini
 meson compile -C build/native
-```
 
-The 32-bit layer, for 32-bit games — which is a good share of the audience for CRT shaders:
-
-```bash
+# The 32-bit layer, for 32-bit games -- a good share of the audience for CRT shaders.
 meson setup build/linux32 --native-file meson/native-clang.ini \
                           --cross-file meson/cross-clang-linux32.ini
 meson compile -C build/linux32
@@ -51,33 +102,23 @@ CMake produces the same binaries, for anyone who would rather review that:
 cmake -B build/cmake -S . && cmake --build build/cmake -j
 ```
 
-## Trying it
-
-There is no installer yet (phase 7). Point the loader at the manifest by hand:
+## Running from the build tree
 
 ```bash
-# the manifest's library_path must resolve; an absolute path is simplest while developing
-sed "s#\"./libVkLayer_ShaderGlass.so\"#\"$PWD/build/native/layer/libVkLayer_ShaderGlass.so\"#" \
-    layer/manifest/VK_LAYER_SHADERGLASS.json > build/manifest/VK_LAYER_SHADERGLASS.json
-
-VK_ADD_IMPLICIT_LAYER_PATH="$PWD/build/manifest" SHADERGLASS=1 vkcube
+tools/local-install.sh               # manifests pointing at build/, and the session layer order
+tools/local-install.sh --uninstall
 ```
 
-`VK_ADD_IMPLICIT_LAYER_PATH`, not `VK_ADD_LAYER_PATH` — the latter only covers explicit layers and
-will silently do nothing here.
+A rebuild then takes effect without reinstalling. The layer finds the catalogue in `build/catalog`
+by itself.
 
-In another terminal:
+`shaderglass-ctl` drives the same settings the interface does, from a shell:
 
 ```bash
 SHM=/tmp/shaderglass-$UID/shm.bin
 ./build/native/tools/shaderglass-ctl $SHM status
 ./build/native/tools/shaderglass-ctl $SHM settings
-
-# Any preset id selects the built-in passthrough until the catalogue exists.
-./build/native/tools/shaderglass-ctl $SHM preset __builtin
-
-# Show the shader a quarter-size raster -- ShaderGlass's "pixel size", which at
-# nearest sampling makes the result visibly chunky.
+./build/native/tools/shaderglass-ctl $SHM preset crt/crt-geom
 ./build/native/tools/shaderglass-ctl $SHM set sourcemode 1
 ./build/native/tools/shaderglass-ctl $SHM set sourcedivisor 4
 ```
@@ -87,7 +128,7 @@ SHM=/tmp/shaderglass-$UID/shm.bin
 With matching rasters the passthrough must reproduce the frame exactly, and the layer can prove it:
 
 ```bash
-SHADERGLASS_SELFTEST=1 VK_ADD_IMPLICIT_LAYER_PATH="$PWD/build/manifest" SHADERGLASS=1 vkcube
+SHADERGLASS_SELFTEST=1 SHADERGLASS=1 vkcube     # after tools/local-install.sh
 # [selftest] PASS: the passthrough reproduced the frame exactly (500x500, 1000000 bytes)
 ```
 
@@ -130,18 +171,23 @@ meson test -C build/native
 launch the game, attach to it, or know anything about it beyond what the layer writes into that
 mapping, so it can be started and stopped at any point — including while a game is running.
 
-```bash
-SHADERGLASS_PRESETS=build/catalog/cm/libShaderGlassPresets.so ./build/native/gui/shaderglass-gui
-```
-
 - **Shader** — the catalogue as a tree, with a filter box, and the selected preset's parameters as
   sliders. What it publishes is *overrides*: a parameter you have not touched is absent, so a preset
   with several hundred of them still fits the 128 slots the protocol reserves.
-- **Input** — the source raster the shader is shown. Pixel size, output policy, aspect, crop and
-  frame skip arrive in phase 6 with the layer code that honours them.
+- **Input** — the source raster the shader is shown: native, a divisor, a classic console raster, a
+  custom size, or *Detect automatically*, which measures a pixel-art game's real grid and keeps
+  measuring as scenes change.
+- **Output** — pixel size, output policy (Auto, Stretch, Fit, Fill, Integer, Centre 1:1), aspect
+  correction, rotation and mirrors, and a crop that confines the effect to part of the window, typed
+  or dragged on the newest capture.
+- **Advanced** — frame skip, how often automatic detection re-measures, and the gamescope launch
+  options, with a custom gamescope build if you use one.
 - **Capture** — the matched pair the layer writes on request: the frame the game presented, and the
   frame it presented after the chain ran. There is no preview renderer (decision 8); a second render
   in another process would be a different frame at a different raster.
+
+A setting changed while the game is paused still reaches the screen: the layer composes the frame it
+last had again (`SHADERGLASS_REPAINT=0` turns that off).
 
 Profiles save the preset, the settings and the parameter overrides together, under
 `~/.local/share/ShaderGlass/ShaderGlassVk/profiles`. They are keyed by the same names
@@ -162,7 +208,7 @@ to use rather than calling the generator by hand, because it also applies the sh
 below:
 
 ```bash
-tools/build-catalogue.sh                        # clones into build/slang-shaders
+tools/build-catalogue.sh                        # ../Scripts/slang-shaders, or fetch it
 tools/build-catalogue.sh /path/to/slang-shaders # or use a tree you already have
 
 ./build/native/tools/catalog_test build/catalog/cm/libShaderGlassPresets.so crt/crt-geom
@@ -174,6 +220,12 @@ working on a shader:
 ```bash
 ./build/native/gen/shaderglass-gen --out build/catalog --tree /path/to/slang-shaders
 ```
+
+With no tree named, the catalogue is built from the one the Windows app uses:
+`Scripts/DownloadShaders.bat` clones mausimus's slang-shaders fork, branch `shaderglass`, into
+`Scripts/slang-shaders`, and when that is there it is used as it is. Otherwise the fork is fetched at
+a fixed commit — the one the patches below are made against — so that a package built next year
+applies them the same way.
 
 ### Shader patches
 

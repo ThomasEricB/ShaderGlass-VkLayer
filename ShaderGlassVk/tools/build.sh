@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# ShaderGlassVk: ShaderGlass on a Vulkan layer
+# Copyright (C) 2026 Thomas Eric, bmitch87
+# GNU General Public License v3.0
+# Derived from DLSS5VKLayer's tools/meson-build.sh (relicensed to GPL-3.0, see RELICENSE.md).
+#
 # Build every ShaderGlassVk target: the 64-bit layer and tools, and the 32-bit layer.
 #
 # A 32-bit game loads only a 32-bit layer, and 32-bit games are a good share of the audience for CRT

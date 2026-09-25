@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=ShaderGlass
+GenericName=Shader settings
+Comment=Choose and tune the RetroArch shader applied to games launched with SHADERGLASS=1
+Exec=shaderglass-gui
+Icon=shaderglass
+Terminal=false
+Categories=Game;
+Keywords=shader;crt;retroarch;slang;vulkan;

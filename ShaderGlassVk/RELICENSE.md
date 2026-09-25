@@ -17,10 +17,12 @@ tree. Rather than do that, the reused code is **relicensed to GPL-3.0** for this
 | `layer/src/log.h` | DLSS5VKLayer `layer_linux/src/log.h` |
 | `layer/shaderglass.map` | DLSS5VKLayer `layer_linux/dlssnr.map` |
 | `tools/shmctl.cpp` | DLSS5VKLayer `tools/shmctl.cpp` |
-| `meson/*.ini`, build and packaging scaffolding | DLSS5VKLayer |
+| `gui/shm_binder.{h,cpp}` | DLSS5VKLayer `gui/` — the widget-to-mapping binder, its latching of settings that force a rebuild, and profile blobs |
+| `gui/mainwindow.{h,cpp}` | DLSS5VKLayer's settings window, in shape: the tabbed layout, the status line and the profile row. The tabs and what is on them are new |
+| `meson/*.ini`, `tools/build.sh`, `packaging/` | DLSS5VKLayer — the cross files, and the release layout: a staged tree shared by tarball, RPM and DEB, `install.sh --user/--system`, one manifest per architecture |
 
-Later phases will reuse more: `shader_vk.{h,cpp}`, `capture.{h,cpp}`, and the Qt interface's
-`mainwindow`, `shm_binder` and profile handling. This file is updated as they land.
+Planned but not reused in the end: `shader_vk.{h,cpp}` and `capture.{h,cpp}`. The chain builds its
+own graphics pipelines, and captures are written by the chain itself (`layer/src/chain.cpp`).
 
 Not reused, and deliberately absent: everything NVIDIA-specific. The NGX ABI, parameter block, SEH
 guard and snippet lifecycle (`core/`), the Windows helper process (`helper/`), optical flow, the

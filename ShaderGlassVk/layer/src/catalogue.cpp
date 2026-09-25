@@ -74,6 +74,9 @@ std::vector<std::string> CandidatePaths() {
         out.push_back(dir + "/" + kLibrary);                   // installed beside the layer
         out.push_back(dir + "/../presets/" + kLibrary);        // installed, one directory over
         out.push_back(dir + "/../../catalog/" + kCatalogDir + "/" + kLibrary);  // build tree
+        // The interface and the tools, installed in <prefix>/bin beside a <prefix>/lib/shaderglass
+        // -- whatever the prefix, which the fixed paths below cannot know.
+        out.push_back(dir + "/../lib/shaderglass/" + kLibrary);
     }
 
     const char* home = getenv("HOME");

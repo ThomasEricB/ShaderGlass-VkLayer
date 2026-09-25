@@ -1,0 +1,56 @@
+# Maintainer: Thomas Eric <thombelcar@gmail.com>
+# Derived in structure from DLSS5VKLayer's PKGBUILD (relicensed to GPL-3.0, see RELICENSE.md).
+#
+# ShaderGlassVk: ShaderGlass on a Vulkan layer. Built from source: the layers (both architectures),
+# the tools, and the preset catalogue compiled from mausimus's slang-shaders at the commit the shader
+# patches in ShaderGlassVk/patches are made against.
+#
+# The port lives in its own repository until it is merged upstream; SHADERGLASS_REPO and
+# SHADERGLASS_BRANCH point this at another clone -- a local one while testing:
+#
+#   SHADERGLASS_REPO=/path/to/ShaderGlass makepkg -si
+
+pkgname=shaderglass-vk
+pkgver=0.1.0
+pkgrel=1
+_shaders_commit=85261c9a96ac014919954de741595a05f48caf19
+_repo="${SHADERGLASS_REPO:-https://github.com/ThomasEricB/ShaderGlass-VkLayer.git}"
+_branch="${SHADERGLASS_BRANCH:-dev}"
+[[ $_repo == /* ]] && _repo="file://$_repo"  # a local clone, named by its path
+pkgdesc='RetroArch shader presets applied to games, as a Vulkan layer'
+arch=('x86_64')
+url='https://github.com/mausimus/ShaderGlass'
+license=('GPL-3.0-only')
+depends=('glibc' 'gcc-libs' 'vulkan-icd-loader' 'qt6-base' 'glslang')
+# spirv-cross is used when installed, and then shaderglass-gen can cross-check its own SPIR-V reader
+# against it; without it the built-in reader does the work alone.
+makedepends=('git' 'meson' 'ninja' 'cmake' 'clang' 'llvm' 'gcc' 'lib32-glibc' 'lib32-gcc-libs'
+             'stb')
+optdepends=('lib32-glibc: shading 32-bit games'
+            'gamescope: shading OpenGL games, and gamescope-scaled output'
+            'mesa: Zink, for running OpenGL games through Vulkan')
+source=("ShaderGlass::git+${_repo}#branch=${_branch}"
+        "slang-shaders::git+https://github.com/mausimus/slang-shaders.git#commit=${_shaders_commit}")
+sha256sums=('SKIP' 'SKIP')
+# No debug package: the catalogue is 130 MB of SPIR-V tables with nothing to debug. And no LTO over
+# thousands of generated translation units, which only makes the build slower.
+options=('!debug' '!lto')
+
+build() {
+    cd "${srcdir}/ShaderGlass/ShaderGlassVk"
+    SHADERGLASS_BUILD_ROOT=build tools/build.sh
+    # Applies the patches to the tree makepkg fetched, and stops if one does not apply.
+    SHADERGLASS_BUILD_ROOT=build tools/build-catalogue.sh "${srcdir}/slang-shaders"
+}
+
+check() {
+    cd "${srcdir}/ShaderGlass/ShaderGlassVk"
+    meson test -C build/native --print-errorlogs
+}
+
+package() {
+    cd "${srcdir}/ShaderGlass/ShaderGlassVk"
+    SHADERGLASS_BUILD_ROOT=build SHADERGLASS_VERSION="${pkgver}" SHADERGLASS_RELEASE="${pkgrel}" \
+        packaging/make-dist.sh stage
+    cp -a "dist/${pkgname}-${pkgver}-${pkgrel}-linux-x86_64/root/usr" "${pkgdir}/"
+}

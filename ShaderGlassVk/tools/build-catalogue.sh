@@ -8,8 +8,14 @@
 # catalogue built without them ships presets that render black. If patching fails this stops rather
 # than generating anyway.
 #
-#   tools/build-catalogue.sh                      # clone into build/slang-shaders, then build
+#   tools/build-catalogue.sh                      # ../Scripts/slang-shaders, or fetch one
 #   tools/build-catalogue.sh /path/to/slang-shaders
+#
+# With no tree named, the one the Windows app builds from is used: Scripts/DownloadShaders.bat clones
+# mausimus's slang-shaders fork, branch "shaderglass", into Scripts/slang-shaders beside this tree.
+# If it is not there, that fork is fetched at SHADERS_REF -- a fixed commit, because the patches in
+# ../patches are made against it, and a package built from a moving branch would one day find a patch
+# that no longer applies.
 #
 # Both architectures are built. A shared object has one, and a 32-bit game cannot load a 64-bit
 # catalogue -- GoldSrc, Source and a good share of what CRT shaders are wanted for are 32-bit, so
@@ -19,14 +25,22 @@
 # Environment:
 #   SHADERGLASS_BUILD_ROOT   where build output goes (default: build)
 #   SHADERGLASS_GEN          the generator to use (default: $BUILD_ROOT/native/gen/shaderglass-gen)
-#   SHADERS_URL              where to clone from
+#   SHADERS_URL              where to fetch from (default: mausimus/slang-shaders)
+#   SHADERS_REF              the commit to fetch (default: the one the patches were made against)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 BUILD_ROOT=${SHADERGLASS_BUILD_ROOT:-build}
 GEN=${SHADERGLASS_GEN:-$BUILD_ROOT/native/gen/shaderglass-gen}
-SHADERS_URL=${SHADERS_URL:-https://github.com/libretro/slang-shaders.git}
-TREE=${1:-$BUILD_ROOT/slang-shaders}
+SHADERS_URL=${SHADERS_URL:-https://github.com/mausimus/slang-shaders.git}
+SHADERS_REF=${SHADERS_REF:-85261c9a96ac014919954de741595a05f48caf19}
+if [ -n "${1:-}" ]; then
+    TREE=$1
+elif [ -d ../Scripts/slang-shaders ]; then
+    TREE=../Scripts/slang-shaders
+else
+    TREE=$BUILD_ROOT/slang-shaders
+fi
 
 if [ ! -x "$GEN" ]; then
     echo "no generator at $GEN -- build it first (tools/build.sh), or set SHADERGLASS_GEN" >&2
@@ -38,8 +52,11 @@ if [ ! -d "$TREE" ]; then
         echo "no shader tree at $TREE" >&2
         exit 2
     fi
-    echo "cloning $SHADERS_URL into $TREE"
-    git clone --depth 1 "$SHADERS_URL" "$TREE"
+    # One commit and nothing else: GitHub serves a commit by hash, so there is no history to clone.
+    echo "fetching $SHADERS_URL at ${SHADERS_REF:0:12} into $TREE"
+    git init -q "$TREE"
+    git -C "$TREE" fetch -q --depth 1 "$SHADERS_URL" "$SHADERS_REF"
+    git -C "$TREE" checkout -q FETCH_HEAD
 fi
 
 # Not optional, and not silent: the tree is modified in place, and tools/patch-shaders.sh --revert
