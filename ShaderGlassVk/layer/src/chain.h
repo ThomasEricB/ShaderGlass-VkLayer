@@ -213,6 +213,7 @@ class Chain {
         // A passthrough with a rotated MVP -- a blit can mirror an image but cannot turn it.
         bool turn = false;
         std::string alias;
+        bool Named(const std::string& n) const { return !n.empty() && n == alias; }
 
         // Derived when the chain is built.
         VkFormat format = VK_FORMAT_UNDEFINED;
@@ -267,6 +268,16 @@ class Chain {
     // source raster, which is passed in rather than stored because it is whichever of two images
     // the raster happened to call for.
     const Image* Resolve(const TextureRef& ref, size_t passIndex, const Image* original) const;
+
+    // The aliases the preset's passes answer to, for classifying a sampler or uniform name ahead of
+    // the built-in ones.
+    PassNamed PassNames() const {
+        return [this](const std::string& n) {
+            for (const auto& p : _passes)
+                if (p.Named(n)) return true;
+            return false;
+        };
+    }
 
     // As Resolve, but returns nullptr instead of falling back when a name matches nothing the
     // preset declared. A sampler must be bound to something valid, so Resolve substitutes the

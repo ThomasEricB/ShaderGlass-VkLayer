@@ -53,9 +53,26 @@ bool ParseBool(const std::string& value, bool fallback) {
     return fallback;
 }
 
-TextureRef ClassifyTexture(const std::string& name) {
+TextureRef ClassifyTexture(const std::string& name, const PassNamed& passNamed) {
     TextureRef ref;
     ref.name = name;
+
+    // A name a pass answers to, and that name with "Feedback" on the end, before anything built in.
+    if (passNamed) {
+        if (passNamed(name)) {
+            ref.semantic = TextureSemantic::kLut;
+            return ref;
+        }
+        static const std::string kFeedbackSuffix = "Feedback";
+        if (name.size() > kFeedbackSuffix.size() &&
+            name.compare(name.size() - kFeedbackSuffix.size(), kFeedbackSuffix.size(),
+                         kFeedbackSuffix) == 0 &&
+            passNamed(name.substr(0, name.size() - kFeedbackSuffix.size()))) {
+            ref.semantic = TextureSemantic::kAliasFeedback;
+            ref.name = name.substr(0, name.size() - kFeedbackSuffix.size());
+            return ref;
+        }
+    }
 
     if (name == "Original") {
         ref.semantic = TextureSemantic::kOriginal;
@@ -108,7 +125,7 @@ TextureRef ClassifyTexture(const std::string& name) {
     return ref;
 }
 
-UniformRef ClassifyUniform(const std::string& name) {
+UniformRef ClassifyUniform(const std::string& name, const PassNamed& passNamed) {
     UniformRef ref;
 
     if (name == "MVP") {
@@ -181,7 +198,7 @@ UniformRef ClassifyUniform(const std::string& name) {
     static const std::string kSize = "Size";
     if (name.size() > kSize.size() &&
         name.compare(name.size() - kSize.size(), kSize.size(), kSize) == 0) {
-        ref.texture = ClassifyTexture(name.substr(0, name.size() - kSize.size()));
+        ref.texture = ClassifyTexture(name.substr(0, name.size() - kSize.size()), passNamed);
         ref.semantic = UniformSemantic::kTextureSize;
         return ref;
     }

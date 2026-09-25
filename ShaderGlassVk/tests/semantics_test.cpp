@@ -82,6 +82,31 @@ int main() {
         Check(ref.name == "AfterglowPass", "...of the pass aliased AfterglowPass");
     }
 
+    // A pass's own name is looked up before the built-in names, as libretro does.
+    // mixed-res-nnedi3-luma aliases pass 7 "PassOutput0" and pass 10 "PassOutput3".
+    {
+        const PassNamed named = [](const std::string& n) {
+            return n == "PassOutput0" || n == "PassOutput3" || n == "nnediPass0";
+        };
+        TextureRef ref = ClassifyTexture("PassOutput0", named);
+        Check(ref.semantic == TextureSemantic::kLut && ref.name == "PassOutput0",
+              "PassOutput0 aliased by the preset is that pass, not pass 0");
+        ref = ClassifyTexture("PassOutput1", named);
+        Check(ref.semantic == TextureSemantic::kPassOutput && ref.index == 1,
+              "PassOutput1, not aliased, is still pass 1");
+        ref = ClassifyTexture("nnediPass0Feedback", named);
+        Check(ref.semantic == TextureSemantic::kAliasFeedback && ref.name == "nnediPass0",
+              "a pass name with Feedback is that pass's previous frame");
+        UniformRef u = ClassifyUniform("PassOutput3Size", named);
+        Check(u.semantic == UniformSemantic::kTextureSize &&
+                  u.texture.semantic == TextureSemantic::kLut && u.texture.name == "PassOutput3",
+              "PassOutput3Size sizes the pass aliased PassOutput3");
+        u = ClassifyUniform("PassOutputSize0", named);
+        Check(u.semantic == UniformSemantic::kTextureSize &&
+                  u.texture.semantic == TextureSemantic::kPassOutput && u.texture.index == 0,
+              "PassOutputSize0 is always the built-in pass 0");
+    }
+
     // "OriginalFeedback" is the previous frame's Original, which OriginalHistory1 already names.
     CheckTexture("OriginalFeedback", TextureSemantic::kHistory, 1);
 

@@ -1,0 +1,83 @@
+Fix mixed-res-nnedi3-luma naming its nnedi3 passes by their old names
+
+The nnedi3 shaders read the passes before them by alias: jinc2-on-passoutput0
+samples nnediPass0 (the YUV conversion) and yuv-to-rgb-2x samples nnediPass3
+(the chroma-shifted luma), as the standalone nnedi3 presets declare them:
+
+    alias0 = nnediPass0
+
+The mixed-res presets embed the same shaders at passes 7 and 10, and still
+alias those passes the way the shaders used to read them:
+
+    alias7 = "PassOutput0"
+    alias10 = "PassOutput3"
+
+Nothing is called nnediPass0 or nnediPass3 in these presets any more, so the
+two samplers resolve to nothing: the chroma comes out wrong -- magenta over the
+whole picture -- and the luma of pass 11 is flat white.
+
+Renaming the aliases to the names the shaders ask for is the whole fix. The
+2x, 3x and 4x presets are identical in this respect.
+
+Reported upstream; this patch is here so the presets are usable meanwhile.
+
+--- a/downsample/mixed-res/2x/mixed-res-nnedi3-luma.slangp
++++ b/downsample/mixed-res/2x/mixed-res-nnedi3-luma.slangp
+@@ -46,7 +46,7 @@
+ shader7 = "../../../edge-smoothing/nnedi3/shaders/rgb-to-yuv.slang"
+ filter_linear7 = false
+ wrap_mode7 = "clamp_to_edge"
+-alias7 = "PassOutput0"
++alias7 = "nnediPass0"
+ scale_type7 = source
+ scale7 = 1.0
+ 
+@@ -68,7 +68,7 @@
+ 
+ shader10 =  "../../../edge-smoothing/nnedi3/shaders/jinc2-cshift-luma.slang"
+ filter_linear10 =  false
+-alias10 = "PassOutput3"
++alias10 = "nnediPass3"
+ wrap_mode10 =  "clamp_to_edge"
+ srgb_framebuffer10 =  "true"
+ scale_type10 =  source
+--- a/downsample/mixed-res/3x/mixed-res-nnedi3-luma.slangp
++++ b/downsample/mixed-res/3x/mixed-res-nnedi3-luma.slangp
+@@ -46,7 +46,7 @@
+ shader7 = "../../../edge-smoothing/nnedi3/shaders/rgb-to-yuv.slang"
+ filter_linear7 = false
+ wrap_mode7 = "clamp_to_edge"
+-alias7 = "PassOutput0"
++alias7 = "nnediPass0"
+ scale_type7 = source
+ scale7 = 1.0
+ 
+@@ -68,7 +68,7 @@
+ 
+ shader10 =  "../../../edge-smoothing/nnedi3/shaders/jinc2-cshift-luma.slang"
+ filter_linear10 =  false
+-alias10 = "PassOutput3"
++alias10 = "nnediPass3"
+ wrap_mode10 =  "clamp_to_edge"
+ srgb_framebuffer10 =  "true"
+ scale_type10 =  source
+--- a/downsample/mixed-res/4x/mixed-res-nnedi3-luma.slangp
++++ b/downsample/mixed-res/4x/mixed-res-nnedi3-luma.slangp
+@@ -48,7 +48,7 @@
+ shader7 = "../../../edge-smoothing/nnedi3/shaders/rgb-to-yuv.slang"
+ filter_linear7 = false
+ wrap_mode7 = "clamp_to_edge"
+-alias7 = "PassOutput0"
++alias7 = "nnediPass0"
+ scale_type7 = source
+ scale7 = 1.0
+ 
+@@ -70,7 +70,7 @@
+ 
+ shader10 =  "../../../edge-smoothing/nnedi3/shaders/jinc2-cshift-luma.slang"
+ filter_linear10 =  false
+-alias10 = "PassOutput3"
++alias10 = "nnediPass3"
+ wrap_mode10 =  "clamp_to_edge"
+ srgb_framebuffer10 =  "true"
+ scale_type10 =  source

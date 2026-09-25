@@ -21,6 +21,7 @@ pass model that can be tested without a device -- see tests/semantics_test.cpp.
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 
 namespace shaderglass {
@@ -90,12 +91,21 @@ ScaleType ParseScaleType(const std::string& value, ScaleType fallback);
 WrapMode ParseWrapMode(const std::string& value, WrapMode fallback);
 bool ParseBool(const std::string& value, bool fallback);
 
+// Whether a name is one a pass of the preset answers to: its alias (from the preset, or failing
+// that the shader's #pragma name -- the generator has folded the two).
+using PassNamed = std::function<bool(const std::string&)>;
+
 // Classify a sampler name. Names that match nothing structural are LUTs -- a preset texture or a
 // pass alias -- which the chain resolves against what the preset actually declared.
-TextureRef ClassifyTexture(const std::string& name);
+//
+// A pass's own name comes first, before the built-in names, which is libretro's order: a preset
+// may alias a pass "PassOutput0", and a shader asking for PassOutput0 then means that pass, not
+// pass 0. mixed-res-nnedi3-luma does exactly this.
+TextureRef ClassifyTexture(const std::string& name, const PassNamed& passNamed = {});
 
-// Classify a uniform block member name.
-UniformRef ClassifyUniform(const std::string& name);
+// Classify a uniform block member name. "<name>Size" consults the pass names the same way; the
+// built-in spelling with the index after "Size" (PassOutputSize0) is always the built-in.
+UniformRef ClassifyUniform(const std::string& name, const PassNamed& passNamed = {});
 
 // The size a pass writes, given its scale settings, what it reads, and the final output.
 void ScaledSize(ScaleType typeX, float scaleX, ScaleType typeY, float scaleY, uint32_t inputW,

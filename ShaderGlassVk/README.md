@@ -111,6 +111,10 @@ VK_LOADER_LAYERS_ENABLE=VK_LAYER_KHRONOS_validation \
   ./build/native/tools/chain_test
 
 # chain_test [--stride N] [--limit N] [--width W] [--height H] [preset-id ...]
+#   --source WxH       a source raster smaller than the frame, as the output tab sets one
+#   --frames N         run N frames instead of 2, for what feedback does over time
+#   --stats            per-pass ranges and NaN counts
+#   --dump DIR         write the result of each preset as a picture; with --dump-passes, every pass
 ```
 
 Each preset is recorded twice, so feedback passes have a previous frame to read and the history ring
@@ -181,6 +185,14 @@ of every frame comes out black.
 
 `bezel/scanline-classic`'s `limiter.slang` has the same fault applied to a composite signal's
 sub-black excursions.
+
+`downsample/mixed-res/*/mixed-res-nnedi3-luma` still names its nnedi3 passes `PassOutput0` and
+`PassOutput3`, from before those shaders were changed to read `nnediPass0` and `nnediPass3`; the two
+samplers find nothing, and the picture comes out magenta.
+
+`bezel/koko-aio` ships with `_HAS_ROTATION_UNIFORM` commented out for old RetroArch versions, so it
+guesses rotation from pass sizes instead of reading the `Rotation` uniform. The guess is wrong for its
+fixed-size ambient-light pass, which leaves black rectangles in the glow either side of the bezel.
 
 `tools/build-catalogue.sh` applies them, and stops rather than generating from an unpatched tree, so
 a shipped catalogue cannot quietly be missing them. The tree is modified in place; the patches are

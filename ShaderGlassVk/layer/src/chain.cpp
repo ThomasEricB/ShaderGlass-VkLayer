@@ -420,13 +420,13 @@ bool Chain::BuildPasses(const SgPreset* preset) {
     for (const auto& pass : _passes) {
         if (!pass.shader) continue;
         for (size_t s = 0; s < pass.shader->sampler_count; ++s) {
-            const TextureRef ref = ClassifyTexture(pass.shader->samplers[s].name);
+            const TextureRef ref = ClassifyTexture(pass.shader->samplers[s].name, PassNames());
             if (ref.semantic == TextureSemantic::kPassFeedback && ref.index < _passes.size())
                 _passes[ref.index].feedback = true;
             if (ref.semantic == TextureSemantic::kAliasFeedback) {
                 // By alias rather than by index, so the pass it names has to be looked up.
                 for (auto& other : _passes)
-                    if (!other.alias.empty() && other.alias == ref.name) other.feedback = true;
+                    if (other.Named(ref.name)) other.feedback = true;
             }
             if (ref.semantic == TextureSemantic::kHistory)
                 _historyDepth = std::max(_historyDepth, ref.index);
@@ -465,7 +465,7 @@ bool Chain::BuildPassResources(Pass& pass, uint32_t index) {
 
             UniformSlot slot;
             slot.name = sp.name ? sp.name : "";
-            const UniformRef ref = ClassifyUniform(slot.name);
+            const UniformRef ref = ClassifyUniform(slot.name, PassNames());
             slot.semantic = ref.semantic;
             slot.texture = ref.texture;
             slot.push = sp.buffer < 0;
@@ -486,8 +486,8 @@ bool Chain::BuildPassResources(Pass& pass, uint32_t index) {
         for (size_t s = 0; s < pass.shader->sampler_count; ++s) {
             SamplerSlot slot;
             slot.binding = uint32_t(pass.shader->samplers[s].binding);
-            slot.ref = ClassifyTexture(pass.shader->samplers[s].name ? pass.shader->samplers[s].name
-                                                                     : "");
+            slot.ref = ClassifyTexture(
+                pass.shader->samplers[s].name ? pass.shader->samplers[s].name : "", PassNames());
             pass.samplers.push_back(std::move(slot));
         }
     } else {
@@ -1181,7 +1181,7 @@ const Image* Chain::ResolveStrict(const TextureRef& ref, size_t passIndex,
                                   const Image* original) const {
     if (ref.semantic == TextureSemantic::kLut) {
         for (const auto& p : _passes)
-            if (!p.alias.empty() && p.alias == ref.name) return &p.output[p.current];
+            if (p.Named(ref.name)) return &p.output[p.current];
         for (const auto& lut : _luts)
             if (lut.name == ref.name && lut.image.image) return &lut.image;
         return nullptr;
@@ -1234,7 +1234,7 @@ const Image* Chain::Resolve(const TextureRef& ref, size_t passIndex, const Image
 
         case TextureSemantic::kAliasFeedback: {
             for (const auto& p : _passes) {
-                if (p.alias.empty() || p.alias != ref.name) continue;
+                if (!p.Named(ref.name)) continue;
                 return p.feedback ? &p.output[1 - p.current] : &p.output[p.current];
             }
             // No pass carries that alias. It may still be a texture whose name simply ends in
@@ -1248,7 +1248,7 @@ const Image* Chain::Resolve(const TextureRef& ref, size_t passIndex, const Image
         default: {
             // A pass alias shadows a texture name, which is the order libretro resolves them in.
             for (const auto& p : _passes)
-                if (!p.alias.empty() && p.alias == ref.name) return &p.output[p.current];
+                if (p.Named(ref.name)) return &p.output[p.current];
             for (const auto& lut : _luts)
                 if (lut.name == ref.name && lut.image.image) return &lut.image;
 

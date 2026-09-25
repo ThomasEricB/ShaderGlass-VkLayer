@@ -119,6 +119,17 @@ every pixel whose luma falls below the shader's threshold.
 excursions: its gamma guard is `color.r < 1.0`, meant to leave extended values above 1.0 alone,
 which also admits the values below zero the same signal carries deliberately.
 
+Two more are not about arithmetic. `mixed-res-nnedi3-luma` (2x, 3x, 4x) aliases its nnedi3 passes
+`PassOutput0` and `PassOutput3`, the names those shaders sampled before they were changed to read
+`nnediPass0` and `nnediPass3`, so both samplers resolve to nothing. And `koko-aio` ships its
+`_HAS_ROTATION_UNIFORM` define commented out, for RetroArch versions before 1.16; without it every
+pass guesses rotation from whether its own size has the viewport's aspect, which a fixed 96x64
+ambient-light pass never does, so the glow is computed as though the game were turned.
+
+Finding the nnedi3 one also turned up a real resolution-order difference: a name is looked up among
+the preset's aliases **before** the built-in `PassOutput#`/`Original`/... names, as RetroArch does,
+so a preset that aliases a pass "PassOutput0" means that pass.
+
 ### Auditing the semantics, rather than remembering them
 
 An unimplemented semantic does not fail. It reads zero, and the shader carries on into a divide or a

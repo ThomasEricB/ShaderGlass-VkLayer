@@ -1,0 +1,31 @@
+Let koko-aio read rotation from the Rotation uniform
+
+koko-aio decides whether the picture is rotated in one of two ways. With
+_HAS_ROTATION_UNIFORM defined it reads the Rotation uniform, which RetroArch
+1.16 and later provide, and so does this layer. Without it, it falls back to a
+guess: a pass whose OutputSize has a different aspect from FinalViewportSize is
+taken to be rotated. The fallback says of itself that it "only works if the
+calling pass scales to viewport".
+
+The libretro copy ships with the define commented out, for the sake of older
+RetroArch versions, so every pass takes the guess. The ambient light pass,
+ambi_temporal_pass, is a fixed 96x64. Unless the viewport is also exactly 3:2,
+it concludes the game is rotated and maps the region "under the tube" -- the
+part it leaves black -- as though the picture were turned: a narrow band across
+the whole width. On a 16:9 or 21:9 screen that band pokes out of both sides of
+the bezel as two hard black rectangles in the middle of the ambient glow.
+
+The Rotation uniform is there, so use it, as the comment beside the define
+asks of any RetroArch newer than 1.16.
+
+--- a/bezel/koko-aio/config/config-static.inc
++++ b/bezel/koko-aio/config/config-static.inc
+@@ -11,7 +11,7 @@
+ 
+ 
+ 	// In case you're running an old Retrtoarch version (pre 1.16), please comment this (prepend: // )
+-//#define _HAS_ROTATION_UNIFORM
++#define _HAS_ROTATION_UNIFORM
+ 
+ #define D3D_WORKAROUND
+ 

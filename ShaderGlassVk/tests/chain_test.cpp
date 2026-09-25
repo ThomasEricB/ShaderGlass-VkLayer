@@ -18,7 +18,8 @@ and records every preset in turn. Run it under the validation layer and it check
     VK_LOADER_LAYERS_ENABLE=VK_LAYER_KHRONOS_validation \
     SHADERGLASS_PRESETS=build/catalog/cm/libShaderGlassPresets.so build/native/tools/chain_test
 
-    chain_test [--isolate] [--dump DIR] [--stride N] [--limit N] [--width W] [--height H]
+    chain_test [--isolate] [--dump DIR [--dump-passes]] [--frames N] [--source WxH] [--stride N] [--limit N]
+               [--width W] [--height H]
                [preset-id ...]
 
 --dump puts a test pattern through each preset and writes the result as a PPM, which is the only
@@ -664,6 +665,20 @@ int PlacementSuite(Device& d, VkFormat format, bool storage) {
     return failures;
 }
 
+// How many frames each preset runs. Two by default -- enough for a feedback pass to have a previous
+// frame -- and more with --frames, for what only shows up over time: a smoothed value drifting, a NaN
+// spreading through a feedback loop.
+uint64_t g_frames = 2;
+
+// --dump-passes: with --stats and --dump, every pass is also written out as a picture, clamped to
+// 0..1 -- for finding which pass puts something on screen that should not be there.
+bool g_dumpPasses = false;
+
+// --source WxH: the source raster, when it should differ from the frame -- what the output tab's
+// source resolution does. A composite-video preset tuned for a 320x224 console fed a 1280x540 frame
+// runs its colour carrier at four times the frequency it was built for, and looks broken for it.
+uint32_t g_sourceW = 0, g_sourceH = 0;
+
 int RunRange(const std::vector<std::string>& ids, size_t from, uint32_t width, uint32_t height,
              bool verbose, int progress, size_t* built, size_t* failed,
              const std::string& dumpDir, bool stats, bool probe) {
@@ -738,7 +753,8 @@ int RunRange(const std::vector<std::string>& ids, size_t from, uint32_t width, u
         }
 
         Chain chain(&d.deviceTable, &d.instanceTable, d.device, d.physical);
-        if (!chain.Prepare(width, height, format, width, height, id)) {
+        if (!chain.Prepare(width, height, format, g_sourceW ? g_sourceW : width,
+                               g_sourceH ? g_sourceH : height, id)) {
             std::printf("FAIL  %-60s %s\n", id.c_str(), chain.Reason());
             std::fflush(stdout);
             ++*failed;
@@ -748,7 +764,7 @@ int RunRange(const std::vector<std::string>& ids, size_t from, uint32_t width, u
             // and FrameCompleted is where it does it. Two frames rather than one so a feedback
             // pass has a previous frame to read and the history ring turns over.
             bool ok = true;
-            for (uint64_t frame = 1; frame <= 2 && ok; ++frame) {
+            for (uint64_t frame = 1; frame <= g_frames && ok; ++frame) {
                 // Before *every* frame, not merely every preset. The chain copies its result back
                 // into this image, exactly as it does to a real swapchain -- but a game renders a
                 // fresh frame each time and nothing here does, so without re-laying the pattern the
@@ -863,6 +879,9 @@ int RunRange(const std::vector<std::string>& ids, size_t from, uint32_t width, u
                     d.deviceTable.vkEndCommandBuffer(d.cb);
                     submitAndWait();
 
+                    std::vector<uint8_t> picture;
+                    if (g_dumpPasses && !dumpDir.empty())
+                        picture.reserve(size_t(info.width) * info.height * 3);
                     float lo[4] = {1e30f, 1e30f, 1e30f, 1e30f};
                     float hi[4] = {-1e30f, -1e30f, -1e30f, -1e30f};
                     double sum[4] = {0, 0, 0, 0};
@@ -879,6 +898,9 @@ int RunRange(const std::vector<std::string>& ids, size_t from, uint32_t width, u
                             break;
                         }
                         texelBytes = stride;
+                        if (g_dumpPasses && !dumpDir.empty())
+                            for (int i = 0; i < 3; ++i)
+                                picture.push_back(c[i] != c[i] ? 255 : uint8_t(std::clamp(c[i], 0.0f, 1.0f) * 255.0f + 0.5f));
                         for (int i = 0; i < 4; ++i) {
                             if (c[i] != c[i]) { ++nan; ++nanCh[i]; }
                             else {
@@ -890,6 +912,18 @@ int RunRange(const std::vector<std::string>& ids, size_t from, uint32_t width, u
                         ++texels;
                     }
 
+                    if (known && !picture.empty()) {
+                        // NaN is written white, so it stands out against whatever the pass drew.
+                        std::string name = id;
+                        std::replace(name.begin(), name.end(), '/', '_');
+                        const std::string path = dumpDir + "/" + name + "-pass" +
+                                                 (pi < 10 ? "0" : "") + std::to_string(pi) + ".ppm";
+                        if (FILE* f = std::fopen(path.c_str(), "wb")) {
+                            std::fprintf(f, "P6\n%u %u\n255\n", info.width, info.height);
+                            std::fwrite(picture.data(), 1, picture.size(), f);
+                            std::fclose(f);
+                        }
+                    }
                     if (!known) {
                         std::printf("    %2u %-34s %4ux%-4u %-12s (not decoded here)\n", pi,
                                     info.name, info.width, info.height, FormatName(info.format));
@@ -975,6 +1009,11 @@ int main(int argc, char** argv) {
         else if (arg == "--width" && i + 1 < argc) width = uint32_t(atoi(argv[++i]));
         else if (arg == "--height" && i + 1 < argc) height = uint32_t(atoi(argv[++i]));
         else if (arg == "--verbose") verbose = true;
+        else if (arg == "--dump-passes") g_dumpPasses = true;
+        else if (arg == "--source" && i + 1 < argc)
+            std::sscanf(argv[++i], "%ux%u", &g_sourceW, &g_sourceH);
+        else if (arg == "--frames" && i + 1 < argc)
+            g_frames = std::max<uint64_t>(1, uint64_t(atoll(argv[++i])));
         else if (arg == "--isolate") isolate = true;
         else if (arg == "--dump" && i + 1 < argc) dumpDir = argv[++i];
         else if (arg == "--stats") stats = true;
