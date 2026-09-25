@@ -15,7 +15,7 @@ pkgver=0.1.0
 pkgrel=1
 _shaders_commit=85261c9a96ac014919954de741595a05f48caf19
 _repo="${SHADERGLASS_REPO:-https://github.com/ThomasEricB/ShaderGlass-VkLayer.git}"
-_branch="${SHADERGLASS_BRANCH:-dev}"
+_branch="${SHADERGLASS_BRANCH:-Vulkan-Layer}"
 [[ $_repo == /* ]] && _repo="file://$_repo"  # a local clone, named by its path
 pkgdesc='RetroArch shader presets applied to games, as a Vulkan layer'
 arch=('x86_64')
